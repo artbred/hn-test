@@ -1,5 +1,6 @@
 import argparse
 import json
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,8 @@ from transformers import (
     TrainingArguments,
 )
 
+warnings.filterwarnings("ignore")
+
 
 def get_device():
     """Detect and return the best available device (MPS for M chip, CUDA for NVIDIA, CPU otherwise)"""
@@ -37,11 +40,23 @@ def get_device():
 
 
 class TitleDataset(Dataset):
-    def __init__(self, texts, labels, tokenizer, max_length=128):
+    def __init__(
+        self,
+        texts,
+        labels,
+        tokenizer,
+        max_length=128,
+        usernames=None,
+        user_stats=None,
+        use_user_features=False,
+    ):
         self.texts = texts
         self.labels = labels
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.usernames = usernames
+        self.user_stats = user_stats
+        self.use_user_features = use_user_features
 
     def __len__(self):
         return len(self.texts)
@@ -49,6 +64,18 @@ class TitleDataset(Dataset):
     def __getitem__(self, idx):
         text = str(self.texts[idx])
         label = self.labels[idx]
+
+        # Prepend user features if enabled
+        if self.use_user_features and self.user_stats is not None:
+            username = (
+                self.usernames[idx] if self.usernames is not None else None
+            )
+            # Explicitly check for NaN to avoid dictionary key issues
+            if username is not None and not pd.isna(username):
+                user_feature_text = generate_user_feature_text(
+                    username, self.user_stats
+                )
+                text = user_feature_text + text
 
         encoding = self.tokenizer(
             text,
@@ -63,6 +90,102 @@ class TitleDataset(Dataset):
             "attention_mask": encoding["attention_mask"].flatten(),
             "labels": torch.tensor(label, dtype=torch.long),
         }
+
+
+class FocalLoss(torch.nn.Module):
+    """
+    Focal Loss for addressing class imbalance in binary/multi-class classification.
+
+    Reference: Lin et al. "Focal Loss for Dense Object Detection" (2017)
+    https://arxiv.org/abs/1708.02002
+
+    Args:
+        alpha: Weighting factor for positive class (range: 0-1). Higher values give more
+               weight to minority class. Default: 0.75
+        gamma: Focusing parameter for modulating loss (range: 0-5). Higher values focus
+               more on hard examples. Default: 2.0
+        reduction: Specifies the reduction to apply to the output: 'none' | 'mean' | 'sum'
+    """
+
+    def __init__(self, alpha=0.75, gamma=2.0, reduction="mean"):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: Logits from model (batch_size, num_classes)
+            targets: Ground truth labels (batch_size)
+
+        Returns:
+            Focal loss value
+        """
+        # Calculate cross entropy loss (no reduction to apply focal modulation per sample)
+        ce_loss = torch.nn.functional.cross_entropy(
+            inputs, targets, reduction="none"
+        )
+
+        # Get probabilities from logits
+        pt = torch.exp(-ce_loss)
+
+        # Apply focal loss formula: FL = -alpha_t * (1 - pt)^gamma * log(pt)
+        # For binary classification with targets 0 or 1:
+        # - alpha_t = alpha if target=1 (minority/positive class)
+        # - alpha_t = (1-alpha) if target=0 (majority/negative class)
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+
+        # Calculate focal loss
+        focal_loss = alpha_t * (1 - pt) ** self.gamma * ce_loss
+
+        # Apply reduction
+        if self.reduction == "mean":
+            return focal_loss.mean()
+        elif self.reduction == "sum":
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+class CustomTrainer(Trainer):
+    """
+    Custom Trainer that uses Focal Loss instead of default Cross Entropy Loss.
+
+    This trainer is specifically designed to handle severe class imbalance by
+    focusing the model's attention on hard-to-classify samples and minority classes.
+    """
+
+    def __init__(self, *args, focal_alpha=0.75, focal_gamma=2.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        print(
+            f"\n✓ Using Focal Loss with alpha={focal_alpha}, gamma={focal_gamma}"
+        )
+
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
+        """
+        Override the compute_loss method to use Focal Loss.
+
+        Args:
+            model: The model being trained
+            inputs: Dictionary containing input_ids, attention_mask, and labels
+            return_outputs: Whether to return model outputs along with loss
+            num_items_in_batch: Number of items in the batch (newer transformers versions)
+
+        Returns:
+            loss (and optionally outputs)
+        """
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        # Calculate focal loss
+        loss = self.focal_loss(logits, labels)
+
+        return (loss, outputs) if return_outputs else loss
 
 
 # 1. Load JSONL file
@@ -91,6 +214,118 @@ def extract_features(text):
     for word in text.split():
         features.append(len(word))
     return features
+
+
+def compute_user_statistics(df, viral_threshold=500):
+    """
+    Compute per-user statistics for feature engineering.
+
+    Args:
+        df: DataFrame with columns 'by' (username), 'score', 'descendants'
+        viral_threshold: Score threshold for viral classification
+
+    Returns:
+        Dictionary mapping username -> user statistics dict
+    """
+    user_stats = {}
+
+    # Always create default stats first (fallback for edge cases)
+    user_stats["__DEFAULT__"] = {
+        "viral_rate": 0.0,
+        "avg_score": 0.0,
+        "post_count": 1.0,
+        "avg_comments": 0.0,
+    }
+
+    # Group by user
+    for username, user_df in df.groupby("by"):
+        if pd.isna(username):
+            continue
+
+        # Calculate statistics
+        scores = user_df["score"].values
+        viral_posts = (scores > viral_threshold).sum()
+        total_posts = len(user_df)
+
+        stats = {
+            "viral_rate": viral_posts / total_posts if total_posts > 0 else 0.0,
+            "avg_score": float(np.mean(scores)) if len(scores) > 0 else 0.0,
+            "post_count": total_posts,
+            "avg_comments": (
+                float(np.mean(user_df["descendants"].fillna(0)))
+                if "descendants" in user_df.columns
+                else 0.0
+            ),
+        }
+
+        user_stats[username] = stats
+
+    # Update default stats with actual medians if we have valid users
+    if len(user_stats) > 1:  # More than just __DEFAULT__
+        # Collect stats from actual users (excluding __DEFAULT__)
+        all_viral_rates = [
+            s["viral_rate"] for k, s in user_stats.items() if k != "__DEFAULT__"
+        ]
+        all_avg_scores = [
+            s["avg_score"] for k, s in user_stats.items() if k != "__DEFAULT__"
+        ]
+        all_post_counts = [
+            s["post_count"] for k, s in user_stats.items() if k != "__DEFAULT__"
+        ]
+        all_avg_comments = [
+            s["avg_comments"]
+            for k, s in user_stats.items()
+            if k != "__DEFAULT__"
+        ]
+
+        # Update default with medians
+        user_stats["__DEFAULT__"] = {
+            "viral_rate": (
+                float(np.median(all_viral_rates)) if all_viral_rates else 0.0
+            ),
+            "avg_score": float(np.median(all_avg_scores))
+            if all_avg_scores
+            else 0.0,
+            "post_count": (
+                float(np.median(all_post_counts)) if all_post_counts else 1.0
+            ),
+            "avg_comments": (
+                float(np.median(all_avg_comments)) if all_avg_comments else 0.0
+            ),
+        }
+
+    return user_stats
+
+
+def generate_user_feature_text(username, user_stats):
+    """
+    Convert user statistics to natural language text for BERT input.
+
+    Args:
+        username: Username to lookup
+        user_stats: Dictionary of user statistics from compute_user_statistics
+
+    Returns:
+        Natural language string describing user's posting history
+    """
+    # Get stats for this user, or use default for unknown users
+    stats = user_stats.get(username, user_stats["__DEFAULT__"])
+
+    # Convert to percentages and round for readability
+    viral_rate_pct = int(stats["viral_rate"] * 100)
+    avg_score = int(stats["avg_score"])
+    post_count = int(stats["post_count"])
+    avg_comments = int(stats["avg_comments"])
+
+    # Generate natural language description
+    feature_text = (
+        f"User has {viral_rate_pct}% viral rate, "
+        f"average score {avg_score}, "
+        f"{post_count} posts, "
+        f"{avg_comments} avg comments. "
+    )
+
+    return feature_text
 
 
 def evaluate_model(trainer, test_dataset):
@@ -217,6 +452,30 @@ def main():
         default=500,
         help="Score threshold for viral classification (default: 500)",
     )
+    parser.add_argument(
+        "--focal-alpha",
+        type=float,
+        default=0.75,
+        help="Focal loss alpha parameter: weight for positive class (0-1). Higher values favor minority class. (default: 0.75)",
+    )
+    parser.add_argument(
+        "--focal-gamma",
+        type=float,
+        default=2.0,
+        help="Focal loss gamma parameter: focusing parameter (0-5). Higher values focus more on hard examples. (default: 2.0)",
+    )
+    parser.add_argument(
+        "--use-user-features",
+        action="store_true",
+        default=True,
+        help="Enable user performance features (viral rate, avg score, post count, avg comments)",
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=256,
+        help="Maximum sequence length for tokenization. Use 200+ when using user features. (default: 128)",
+    )
     args = parser.parse_args()
 
     # Detect device (MPS for M chip, CUDA for NVIDIA, CPU otherwise)
@@ -252,19 +511,95 @@ def main():
     print("\nPercentage distribution:")
     print(df["is_viral"].value_counts(normalize=True) * 100)
 
-    X = df["title"].values
-    y = df["is_viral"].values
-
-    print(f"\nTotal samples: {len(X)}")
-    print(f"Viral posts: {sum(y)} ({sum(y) / len(y) * 100:.2f}%)")
+    print(f"\nTotal samples: {len(df)}")
     print(
-        f"Non-viral posts: {len(y) - sum(y)} ({(len(y) - sum(y)) / len(y) * 100:.2f}%)"
+        f"Viral posts: {df['is_viral'].sum()} ({df['is_viral'].sum() / len(df) * 100:.2f}%)"
+    )
+    print(
+        f"Non-viral posts: {(~df['is_viral'].astype(bool)).sum()} ({(~df['is_viral'].astype(bool)).sum() / len(df) * 100:.2f}%)"
     )
 
-    # Split the data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+    # Split the data FIRST to prevent data leakage
+    # Important: We must compute user statistics ONLY on training data
+    print("\n=== Splitting Data ===")
+    train_indices, test_indices = train_test_split(
+        np.arange(len(df)),
+        test_size=0.2,
+        random_state=42,
+        stratify=df["is_viral"],
     )
+
+    # Create train/test dataframes
+    train_df = df.iloc[train_indices].copy()
+    test_df = df.iloc[test_indices].copy()
+
+    print(
+        f"Training samples: {len(train_df)} ({len(train_df) / len(df) * 100:.1f}%)"
+    )
+    print(f"Test samples: {len(test_df)} ({len(test_df) / len(df) * 100:.1f}%)")
+
+    # Compute user statistics ONLY on training data to prevent data leakage
+    user_stats = None
+    if args.use_user_features:
+        # Validate that "by" column exists
+        if "by" not in train_df.columns:
+            print(
+                "\n⚠ Error: 'by' column not found in data. User features require usernames."
+            )
+            print(
+                "Disabling user features and continuing with text-only model..."
+            )
+            args.use_user_features = False
+        else:
+            print("\n=== Computing User Statistics (Training Data Only) ===")
+            user_stats = compute_user_statistics(
+                train_df, viral_threshold=args.viral_threshold
+            )
+            print(
+                f"✓ Computed statistics for {len(user_stats) - 1} unique users from training data"
+            )
+
+            # Display some example user stats
+            sample_users = list(user_stats.keys())[:3]
+            for username in sample_users:
+                if username != "__DEFAULT__":
+                    stats = user_stats[username]
+                    print(
+                        f"  {username}: viral_rate={stats['viral_rate']:.2%}, "
+                        f"avg_score={stats['avg_score']:.0f}, posts={stats['post_count']}"
+                    )
+
+            # Check for cold-start users in test set
+            test_users = set(test_df["by"].dropna().unique())
+            train_users = set(train_df["by"].dropna().unique())
+            cold_start_users = test_users - train_users
+            if cold_start_users:
+                # Prevent division by zero
+                percentage = (
+                    (len(cold_start_users) / len(test_users) * 100)
+                    if len(test_users) > 0
+                    else 0.0
+                )
+                print(
+                    f"\n⚠ Cold-start users in test set: {len(cold_start_users)} "
+                    f"({percentage:.1f}% of test users)"
+                )
+                print(
+                    "  These users will use default statistics (median values from training data)"
+                )
+
+    # Extract features from train/test dataframes
+    X_train = train_df["title"].values
+    y_train = train_df["is_viral"].values
+    X_test = test_df["title"].values
+    y_test = test_df["is_viral"].values
+
+    if args.use_user_features:
+        usernames_train = train_df["by"].values
+        usernames_test = test_df["by"].values
+    else:
+        usernames_train = None
+        usernames_test = None
 
     model_name = "bert-base-uncased"
 
@@ -274,8 +609,24 @@ def main():
     )
 
     # Create datasets
-    train_dataset = TitleDataset(X_train, y_train, tokenizer)
-    test_dataset = TitleDataset(X_test, y_test, tokenizer)
+    train_dataset = TitleDataset(
+        X_train,
+        y_train,
+        tokenizer,
+        max_length=args.max_length,
+        usernames=usernames_train,
+        user_stats=user_stats,
+        use_user_features=args.use_user_features,
+    )
+    test_dataset = TitleDataset(
+        X_test,
+        y_test,
+        tokenizer,
+        max_length=args.max_length,
+        usernames=usernames_test,
+        user_stats=user_stats,
+        use_user_features=args.use_user_features,
+    )
 
     # Training arguments optimized for Apple Silicon
     training_args = TrainingArguments(
@@ -294,19 +645,25 @@ def main():
         use_cpu=False,  # Ensure we use GPU acceleration
     )
 
-    # Train
-    trainer = Trainer(
+    # Train with Focal Loss
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         tokenizer=tokenizer,
+        focal_alpha=args.focal_alpha,
+        focal_gamma=args.focal_gamma,
     )
 
     print("\n=== Starting Training ===")
     print(f"Device: {device}")
     print(f"Batch size: {args.batch_size}")
     print(f"Epochs: {args.epochs}")
+    print(f"Max sequence length: {args.max_length}")
+    print(
+        f"User features: {'Enabled' if args.use_user_features else 'Disabled'}"
+    )
     print(f"Training samples: {len(train_dataset)}")
     print(f"Test samples: {len(test_dataset)}\n")
 
