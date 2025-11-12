@@ -1,8 +1,17 @@
 import argparse
 import json
 
+import numpy as np
 import pandas as pd
 import torch
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 from transformers import (
@@ -82,6 +91,98 @@ def extract_features(text):
     for word in text.split():
         features.append(len(word))
     return features
+
+
+def evaluate_model(trainer, test_dataset):
+    """
+    Evaluate the trained model and display comprehensive metrics including confusion matrix
+    """
+    print("\n" + "=" * 60)
+    print("EVALUATION RESULTS")
+    print("=" * 60)
+
+    # Get predictions
+    predictions = trainer.predict(test_dataset)
+    pred_labels = np.argmax(predictions.predictions, axis=1)
+    true_labels = predictions.label_ids
+
+    # Calculate metrics (with zero_division parameter to avoid warnings)
+    accuracy = accuracy_score(true_labels, pred_labels)
+    precision = precision_score(true_labels, pred_labels, average="binary")
+    recall = recall_score(true_labels, pred_labels, average="binary")
+    f1 = f1_score(true_labels, pred_labels, average="binary")
+
+    # Display overall metrics
+    print("\n--- Overall Metrics ---")
+    print(f"Accuracy:  {accuracy:.4f} ({accuracy * 100:.2f}%)")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall:    {recall:.4f}")
+    print(f"F1-Score:  {f1:.4f}")
+
+    # Display detailed classification report
+    print("\n--- Detailed Classification Report ---")
+    class_names = ["Non-Viral (0)", "Viral (1)"]
+    print(
+        classification_report(
+            true_labels, pred_labels, target_names=class_names, digits=4
+        )
+    )
+
+    # Calculate and display confusion matrix
+    cm = confusion_matrix(true_labels, pred_labels)
+    print("\n--- Confusion Matrix ---")
+    print("Format: [True Label] vs [Predicted Label]")
+    print()
+    print("                 Predicted Non-Viral  Predicted Viral")
+    print(f"Actual Non-Viral      {cm[0][0]:6d}              {cm[0][1]:6d}")
+    print(f"Actual Viral          {cm[1][0]:6d}              {cm[1][1]:6d}")
+    print()
+
+    # Explain confusion matrix components
+    tn, fp, fn, tp = cm.ravel()
+    print("Breakdown:")
+    print(f"  True Negatives (TN):  {tn:6d} - Correctly predicted as Non-Viral")
+    print(f"  False Positives (FP): {fp:6d} - Incorrectly predicted as Viral")
+    print(
+        f"  False Negatives (FN): {fn:6d} - Incorrectly predicted as Non-Viral"
+    )
+    print(f"  True Positives (TP):  {tp:6d} - Correctly predicted as Viral")
+    print()
+
+    # Calculate additional insights
+    total = len(true_labels)
+    correct = tn + tp
+    incorrect = fp + fn
+
+    print("--- Summary ---")
+    print(f"Total predictions: {total}")
+    print(f"Correct predictions: {correct} ({correct / total * 100:.2f}%)")
+    print(
+        f"Incorrect predictions: {incorrect} ({incorrect / total * 100:.2f}%)"
+    )
+    print()
+
+    # Class-specific accuracy
+    non_viral_accuracy = tn / (tn + fp) if (tn + fp) > 0 else 0
+    viral_accuracy = tp / (tp + fn) if (tp + fn) > 0 else 0
+
+    print("Class-specific Performance:")
+    print(
+        f"  Non-Viral detection rate: {non_viral_accuracy * 100:.2f}% ({tn}/{tn + fn})"
+    )
+    print(
+        f"  Viral detection rate:     {viral_accuracy * 100:.2f}% ({tp}/{tp + fn})"
+    )
+
+    print("=" * 60)
+
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "confusion_matrix": cm,
+    }
 
 
 def main():
@@ -211,11 +312,27 @@ def main():
 
     trainer.train()
 
+    # Evaluate the model
+    metrics = evaluate_model(trainer, test_dataset)
+
     # Save the model
     print("\n=== Saving Model ===")
     trainer.save_model("./results/final_model")
     tokenizer.save_pretrained("./results/final_model")
     print("Model saved to ./results/final_model")
+
+    # Save metrics to file
+    metrics_dict = {
+        "accuracy": float(metrics["accuracy"]),
+        "precision": float(metrics["precision"]),
+        "recall": float(metrics["recall"]),
+        "f1": float(metrics["f1"]),
+        "confusion_matrix": metrics["confusion_matrix"].tolist(),
+    }
+
+    with open("./results/evaluation_metrics.json", "w") as f:
+        json.dump(metrics_dict, f, indent=2)
+    print("Evaluation metrics saved to ./results/evaluation_metrics.json")
 
 
 if __name__ == "__main__":
