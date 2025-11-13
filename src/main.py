@@ -7,8 +7,6 @@ import pandas as pd
 import torch
 from sklearn.metrics import (
     accuracy_score,
-    classification_report,
-    confusion_matrix,
     f1_score,
     precision_score,
     recall_score,
@@ -146,46 +144,6 @@ class FocalLoss(torch.nn.Module):
             return focal_loss.sum()
         else:
             return focal_loss
-
-
-class CustomTrainer(Trainer):
-    """
-    Custom Trainer that uses Focal Loss instead of default Cross Entropy Loss.
-
-    This trainer is specifically designed to handle severe class imbalance by
-    focusing the model's attention on hard-to-classify samples and minority classes.
-    """
-
-    def __init__(self, *args, focal_alpha=0.75, focal_gamma=2.0, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-        print(
-            f"\n✓ Using Focal Loss with alpha={focal_alpha}, gamma={focal_gamma}"
-        )
-
-    def compute_loss(
-        self, model, inputs, return_outputs=False, num_items_in_batch=None
-    ):
-        """
-        Override the compute_loss method to use Focal Loss.
-
-        Args:
-            model: The model being trained
-            inputs: Dictionary containing input_ids, attention_mask, and labels
-            return_outputs: Whether to return model outputs along with loss
-            num_items_in_batch: Number of items in the batch (newer transformers versions)
-
-        Returns:
-            loss (and optionally outputs)
-        """
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        logits = outputs.logits
-
-        # Calculate focal loss
-        loss = self.focal_loss(logits, labels)
-
-        return (loss, outputs) if return_outputs else loss
 
 
 # 1. Load JSONL file
@@ -328,96 +286,57 @@ def generate_user_feature_text(username, user_stats):
     return feature_text
 
 
-def evaluate_model(trainer, test_dataset):
+def compute_metrics(eval_pred):
     """
-    Evaluate the trained model and display comprehensive metrics including confusion matrix
+    Compute metrics for automatic evaluation during training.
+
+    This function is called by Trainer during evaluation to compute metrics.
+
+    Args:
+        eval_pred: EvalPrediction object with predictions and label_ids
+
+    Returns:
+        Dictionary of metric names to values
     """
-    print("\n" + "=" * 60)
-    print("EVALUATION RESULTS")
-    print("=" * 60)
+    predictions = np.argmax(eval_pred.predictions, axis=1)
+    labels = eval_pred.label_ids
 
-    # Get predictions
-    predictions = trainer.predict(test_dataset)
-    pred_labels = np.argmax(predictions.predictions, axis=1)
-    true_labels = predictions.label_ids
-
-    # Calculate metrics (with zero_division parameter to avoid warnings)
-    accuracy = accuracy_score(true_labels, pred_labels)
-    precision = precision_score(true_labels, pred_labels, average="binary")
-    recall = recall_score(true_labels, pred_labels, average="binary")
-    f1 = f1_score(true_labels, pred_labels, average="binary")
-
-    # Display overall metrics
-    print("\n--- Overall Metrics ---")
-    print(f"Accuracy:  {accuracy:.4f} ({accuracy * 100:.2f}%)")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall:    {recall:.4f}")
-    print(f"F1-Score:  {f1:.4f}")
-
-    # Display detailed classification report
-    print("\n--- Detailed Classification Report ---")
-    class_names = ["Non-Viral (0)", "Viral (1)"]
-    print(
-        classification_report(
-            true_labels, pred_labels, target_names=class_names, digits=4
-        )
+    # Calculate metrics
+    accuracy = accuracy_score(labels, predictions)
+    precision = precision_score(
+        labels, predictions, average="binary", zero_division=0
     )
-
-    # Calculate and display confusion matrix
-    cm = confusion_matrix(true_labels, pred_labels)
-    print("\n--- Confusion Matrix ---")
-    print("Format: [True Label] vs [Predicted Label]")
-    print()
-    print("                 Predicted Non-Viral  Predicted Viral")
-    print(f"Actual Non-Viral      {cm[0][0]:6d}              {cm[0][1]:6d}")
-    print(f"Actual Viral          {cm[1][0]:6d}              {cm[1][1]:6d}")
-    print()
-
-    # Explain confusion matrix components
-    tn, fp, fn, tp = cm.ravel()
-    print("Breakdown:")
-    print(f"  True Negatives (TN):  {tn:6d} - Correctly predicted as Non-Viral")
-    print(f"  False Positives (FP): {fp:6d} - Incorrectly predicted as Viral")
-    print(
-        f"  False Negatives (FN): {fn:6d} - Incorrectly predicted as Non-Viral"
+    recall = recall_score(
+        labels, predictions, average="binary", zero_division=0
     )
-    print(f"  True Positives (TP):  {tp:6d} - Correctly predicted as Viral")
-    print()
-
-    # Calculate additional insights
-    total = len(true_labels)
-    correct = tn + tp
-    incorrect = fp + fn
-
-    print("--- Summary ---")
-    print(f"Total predictions: {total}")
-    print(f"Correct predictions: {correct} ({correct / total * 100:.2f}%)")
-    print(
-        f"Incorrect predictions: {incorrect} ({incorrect / total * 100:.2f}%)"
-    )
-    print()
-
-    # Class-specific accuracy
-    non_viral_accuracy = tn / (tn + fp) if (tn + fp) > 0 else 0
-    viral_accuracy = tp / (tp + fn) if (tp + fn) > 0 else 0
-
-    print("Class-specific Performance:")
-    print(
-        f"  Non-Viral detection rate: {non_viral_accuracy * 100:.2f}% ({tn}/{tn + fn})"
-    )
-    print(
-        f"  Viral detection rate:     {viral_accuracy * 100:.2f}% ({tp}/{tp + fn})"
-    )
-
-    print("=" * 60)
+    f1 = f1_score(labels, predictions, average="binary", zero_division=0)
 
     return {
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
         "f1": f1,
-        "confusion_matrix": cm,
     }
+
+
+def compute_focal_loss_func(outputs, labels, num_items_in_batch, focal_loss):
+    """
+    Custom loss function for Trainer using Focal Loss.
+
+    Args:
+        outputs: Model outputs (ModelOutput object or dict with 'logits')
+        labels: Ground truth labels
+        num_items_in_batch: Number of items in accumulated batch
+        focal_loss: FocalLoss instance to use for computing loss
+
+    Returns:
+        loss: Computed focal loss value
+    """
+    logits = (
+        outputs.get("logits") if isinstance(outputs, dict) else outputs.logits
+    )
+    loss = focal_loss(logits, labels)
+    return loss
 
 
 def main():
@@ -639,21 +558,35 @@ def main():
         logging_dir="./logs",
         logging_steps=10,
         save_strategy="epoch",
+        eval_strategy="epoch",  # Evaluate at end of each epoch
+        load_best_model_at_end=True,  # Load the best model when finished
+        metric_for_best_model="f1",  # Use F1 score to determine best model
+        greater_is_better=True,  # Higher F1 is better
         # Use fp16 for better performance on Apple Silicon
         fp16=device.type == "cuda",  # Only for NVIDIA GPUs
         # For MPS (Apple Silicon), use default precision as fp16 is not stable yet
         use_cpu=False,  # Ensure we use GPU acceleration
     )
 
-    # Train with Focal Loss
-    trainer = CustomTrainer(
+    # Create focal loss instance
+    focal_loss = FocalLoss(alpha=args.focal_alpha, gamma=args.focal_gamma)
+    print(
+        f"\n✓ Using Focal Loss with alpha={args.focal_alpha}, gamma={args.focal_gamma}"
+    )
+
+    # Train with custom loss function and automatic metrics
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         tokenizer=tokenizer,
-        focal_alpha=args.focal_alpha,
-        focal_gamma=args.focal_gamma,
+        compute_loss_func=lambda outputs,
+        labels,
+        num_items_in_batch: compute_focal_loss_func(
+            outputs, labels, num_items_in_batch, focal_loss
+        ),
+        compute_metrics=compute_metrics,
     )
 
     print("\n=== Starting Training ===")
@@ -669,8 +602,17 @@ def main():
 
     trainer.train()
 
-    # Evaluate the model
-    metrics = evaluate_model(trainer, test_dataset)
+    # Evaluate the model (metrics computed automatically via compute_metrics)
+    print("\n" + "=" * 60)
+    print("FINAL EVALUATION RESULTS")
+    print("=" * 60)
+    metrics = trainer.evaluate()
+    for key, value in metrics.items():
+        if isinstance(value, float):
+            print(f"{key}: {value:.4f}")
+        else:
+            print(f"{key}: {value}")
+    print("=" * 60)
 
     # Save the model
     print("\n=== Saving Model ===")
@@ -679,16 +621,22 @@ def main():
     print("Model saved to ./results/final_model")
 
     # Save metrics to file
-    metrics_dict = {
-        "accuracy": float(metrics["accuracy"]),
-        "precision": float(metrics["precision"]),
-        "recall": float(metrics["recall"]),
-        "f1": float(metrics["f1"]),
-        "confusion_matrix": metrics["confusion_matrix"].tolist(),
+    # Filter to save only the core metrics (excluding runtime/samples_per_second etc)
+    metrics_to_save = {
+        key: float(value) if isinstance(value, (int, float)) else value
+        for key, value in metrics.items()
+        if key
+        in [
+            "eval_loss",
+            "eval_accuracy",
+            "eval_precision",
+            "eval_recall",
+            "eval_f1",
+        ]
     }
 
     with open("./results/evaluation_metrics.json", "w") as f:
-        json.dump(metrics_dict, f, indent=2)
+        json.dump(metrics_to_save, f, indent=2)
     print("Evaluation metrics saved to ./results/evaluation_metrics.json")
 
 
