@@ -220,7 +220,7 @@ def train_text_head(
     X_valid: np.ndarray,
     config: TrainerConfig,
 ) -> Tuple[TextHead, np.ndarray]:
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps")
     model = TextHead(
         input_dim=X_train.shape[1],
         hidden_dim=config.hidden_dim,
