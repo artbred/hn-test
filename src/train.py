@@ -144,24 +144,6 @@ def save_feature_importance(
     ).sort_values("importance", ascending=False)
     cat_importance.to_csv(cat_path, index=False)
 
-def write_summary(
-    path: Path,
-    dataset_shape: tuple[int, int],
-    viral_rate: float,
-    metrics: Dict[str, Dict[str, float]],
-) -> None:
-    lines = [
-        "# HN Virality Modeling Summary",
-        "",
-        f"- Samples: {dataset_shape[0]:,} rows, {dataset_shape[1]} engineered features",
-        f"- Viral threshold: score > 500, baseline rate {viral_rate:.2%}",
-    ]
-    lines.append("")
-    lines.append("## Validation Metrics")
-    for model_name, values in metrics.items():
-        lines.append(f"- {model_name}: " + ", ".join(f"{k}={v:.4f}" for k, v in values.items()))
-    path.write_text("\n".join(lines))
-
 
 def main() -> None:
     args = parse_args()
@@ -200,18 +182,11 @@ def main() -> None:
 
     metrics_path = args.reports_dir / "metrics.json"
     preds_path = args.reports_dir / "validation_predictions.csv"
-    summary_path = args.reports_dir / "summary.md"
     cat_imp_path = args.reports_dir / "catboost_feature_importance.csv"
 
     save_metrics(metrics_path, metrics)
     save_predictions(preds_path, splits["ids_valid"], cat_valid_probs)
     save_feature_importance(cat_model, cat_imp_path, cat_features=list(splits["X_train"].columns))
-    write_summary(
-        summary_path,
-        dataset_shape=bundle.features.shape,
-        viral_rate=viral_rate,
-        metrics=metrics,
-    )
 
     print(f"Artifacts saved under {args.reports_dir}")
 
