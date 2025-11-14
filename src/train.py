@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,6 +12,7 @@ from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
     f1_score,
+    precision_recall_curve,
     roc_auc_score,
 )
 
@@ -52,6 +53,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=repo_root / "data" / "embeddings" / "title_minilm.npy",
         help="Path to cache sentence-transformer embeddings (.npy).",
+    )
+    parser.add_argument(
+        "--threshold-strategy",
+        choices=("f1", "precision_at_recall"),
+        default="f1",
+        help="How to pick the probability threshold on validation data.",
+    )
+    parser.add_argument(
+        "--target-recall",
+        type=float,
+        default=0.3,
+        help="Minimum recall to satisfy when using precision_at_recall strategy.",
     )
     return parser.parse_args()
 
@@ -145,6 +158,46 @@ def save_feature_importance(
     cat_importance.to_csv(cat_path, index=False)
 
 
+def tune_threshold(
+    y_true: pd.Series,
+    proba: np.ndarray,
+    strategy: str,
+    target_recall: float,
+) -> Tuple[float, Dict[str, float]]:
+    if proba.size == 0:
+        return 0.5, {}
+
+    precision, recall, thresholds = precision_recall_curve(y_true, proba)
+    if thresholds.size == 0:
+        return 0.5, {}
+
+    precision = precision[:-1]
+    recall = recall[:-1]
+    thresholds = thresholds
+
+    if strategy == "f1":
+        denom = precision + recall
+        f1 = np.where(denom > 0, 2 * (precision * recall) / denom, 0.0)
+        best_idx = int(np.nanargmax(f1))
+        return thresholds[best_idx], {
+            "threshold_precision": float(precision[best_idx]),
+            "threshold_recall": float(recall[best_idx]),
+            "threshold_f1": float(f1[best_idx]),
+        }
+
+    mask = recall >= target_recall
+    if not mask.any():
+        best_idx = int(np.nanargmax(recall))
+    else:
+        candidate_idx = np.arange(len(thresholds))[mask]
+        best_idx = int(candidate_idx[np.argmax(precision[mask])])
+
+    return thresholds[best_idx], {
+        "threshold_precision": float(precision[best_idx]),
+        "threshold_recall": float(recall[best_idx]),
+    }
+
+
 def main() -> None:
     args = parse_args()
     args.reports_dir.mkdir(parents=True, exist_ok=True)
@@ -176,8 +229,23 @@ def main() -> None:
     )
     cat_valid_probs = cat_model.predict_proba(splits["X_valid"])[:, 1]
 
+    tuned_threshold, tuning_stats = tune_threshold(
+        splits["y_valid"],
+        cat_valid_probs,
+        strategy=args.threshold_strategy,
+        target_recall=args.target_recall,
+    )
+    cat_metrics = evaluate_metrics(
+        splits["y_valid"], cat_valid_probs, threshold=tuned_threshold
+    )
+    cat_metrics["decision_threshold"] = float(tuned_threshold)
+    cat_metrics["threshold_strategy"] = args.threshold_strategy
+    if args.threshold_strategy == "precision_at_recall":
+        cat_metrics["target_recall"] = float(args.target_recall)
+    cat_metrics.update(tuning_stats)
+
     metrics = {
-        "catboost": evaluate_metrics(splits["y_valid"], cat_valid_probs),
+        "catboost": cat_metrics,
     }
 
     metrics_path = args.reports_dir / "metrics.json"
