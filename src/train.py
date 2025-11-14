@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -66,6 +67,18 @@ def parse_args() -> argparse.Namespace:
         default=0.3,
         help="Minimum recall to satisfy when using precision_at_recall strategy.",
     )
+    parser.add_argument(
+        "--optuna-trials",
+        type=int,
+        default=0,
+        help="Number of Optuna trials to run for CatBoost hyperparameters. 0 disables tuning.",
+    )
+    parser.add_argument(
+        "--optuna-metric",
+        choices=("roc_auc", "pr_auc", "f1"),
+        default="pr_auc",
+        help="Validation metric Optuna should maximize.",
+    )
     return parser.parse_args()
 
 
@@ -90,22 +103,26 @@ def chronological_split(
     }
 
 
-def build_catboost_classifier(class_weights: List[float]) -> CatBoostClassifier:
-    return CatBoostClassifier(
-        depth=8,
-        learning_rate=0.08,
-        iterations=600,
-        loss_function="Logloss",
-        eval_metric="AUC",
-        random_seed=42,
-        early_stopping_rounds=50,
-        l2_leaf_reg=5.0,
-        border_count=254,
-        class_weights=list(class_weights),
-        use_best_model=True,
-        verbose=100,
-        allow_writing_files=False,
-    )
+def build_catboost_classifier(
+    class_weights: List[float], **overrides
+) -> CatBoostClassifier:
+    params = {
+        "depth": 8,
+        "learning_rate": 0.08,
+        "iterations": 600,
+        "loss_function": "Logloss",
+        "eval_metric": "AUC",
+        "random_seed": 42,
+        "early_stopping_rounds": 50,
+        "l2_leaf_reg": 5.0,
+        "border_count": 254,
+        "class_weights": list(class_weights),
+        "use_best_model": True,
+        "verbose": 100,
+        "allow_writing_files": False,
+    }
+    params.update(overrides)
+    return CatBoostClassifier(**params)
 
 
 def compute_class_weights(y: pd.Series) -> Dict[str, float]:
@@ -200,6 +217,79 @@ def tune_threshold(
     }
 
 
+def run_optuna_search(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_valid: pd.DataFrame,
+    y_valid: pd.Series,
+    cat_feature_idx: List[int],
+    class_weights: List[float],
+    metric_name: str,
+    n_trials: int,
+    target_recall: float,
+) -> Dict[str, float]:
+    if n_trials <= 0:
+        return {}
+
+    try:
+        optuna = importlib.import_module("optuna")
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise ImportError(
+            "Optuna is required when --optuna-trials > 0. Install it via `pip install optuna`."
+        ) from exc
+
+    sampler = optuna.samplers.TPESampler(seed=42)
+    study = optuna.create_study(direction="maximize", sampler=sampler)
+
+    def objective(trial) -> float:
+        params = {
+            "depth": trial.suggest_int("depth", 4, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-2, 10.0, log=True),
+            "iterations": trial.suggest_int("iterations", 200, 1000),
+            "border_count": trial.suggest_int("border_count", 64, 254),
+            "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 5.0),
+            "random_strength": trial.suggest_float("random_strength", 1e-3, 2.0, log=True),
+        }
+        model = build_catboost_classifier(
+            class_weights,
+            **params,
+            verbose=0,
+        )
+        model.fit(
+            X_train,
+            y_train,
+            cat_features=cat_feature_idx,
+            eval_set=(X_valid, y_valid),
+            verbose=False,
+        )
+        probs = model.predict_proba(X_valid)[:, 1]
+        roc = roc_auc_score(y_valid, probs)
+        pr = average_precision_score(y_valid, probs)
+
+        if metric_name == "roc_auc":
+            value = roc
+        elif metric_name == "pr_auc":
+            value = pr
+        else:
+            threshold, _ = tune_threshold(
+                y_valid, probs, strategy="f1", target_recall=target_recall
+            )
+            preds = (probs >= threshold).astype(int)
+            value = f1_score(y_valid, preds)
+
+        trial.set_user_attr("roc_auc", float(roc))
+        trial.set_user_attr("pr_auc", float(pr))
+        return float(value)
+
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    print(
+        f"Optuna best {metric_name}: {study.best_value:.4f} "
+        f"with params: {study.best_params}"
+    )
+    return study.best_params
+
+
 def main() -> None:
     args = parse_args()
     args.reports_dir.mkdir(parents=True, exist_ok=True)
@@ -217,16 +307,39 @@ def main() -> None:
 
     splits = chronological_split(bundle, args.train_fraction)
     class_weights = compute_class_weights(splits["y_train"])
-    cat_model = build_catboost_classifier(class_weights["catboost"])
-    cat_cols = [
-        col for col in ["type", "domain", "by"] if col in splits["X_train"].columns
+    cat_feature_idx = [
+        splits["X_train"].columns.get_loc(col)
+        for col in ["type", "domain", "by"]
+        if col in splits["X_train"].columns
     ]
+
+    optuna_params: Dict[str, float | int] = {}
+    if args.optuna_trials > 0:
+        print(
+            f"Running Optuna for {args.optuna_trials} trials optimizing {args.optuna_metric}..."
+        )
+        optuna_params = run_optuna_search(
+            splits["X_train"],
+            splits["y_train"],
+            splits["X_valid"],
+            splits["y_valid"],
+            cat_feature_idx=cat_feature_idx,
+            class_weights=class_weights["catboost"],
+            metric_name=args.optuna_metric,
+            n_trials=args.optuna_trials,
+            target_recall=args.target_recall,
+        )
+
+    cat_model = build_catboost_classifier(
+        class_weights["catboost"],
+        **optuna_params,
+    )
 
     print("Training CatBoost...")
     cat_model.fit(
         splits["X_train"],
         splits["y_train"],
-        cat_features=[splits["X_train"].columns.get_loc(col) for col in cat_cols],
+        cat_features=cat_feature_idx,
         eval_set=(splits["X_valid"], splits["y_valid"]),
     )
     cat_valid_probs = cat_model.predict_proba(splits["X_valid"])[:, 1]
@@ -245,6 +358,19 @@ def main() -> None:
     if args.threshold_strategy == "precision_at_recall":
         cat_metrics["target_recall"] = float(args.target_recall)
     cat_metrics.update(tuning_stats)
+    if args.optuna_trials > 0 and optuna_params:
+        cat_metrics["optuna_trials"] = int(args.optuna_trials)
+        cat_metrics["optuna_metric"] = args.optuna_metric
+        cat_metrics["optuna_best_params"] = {
+            key: (
+                float(value)
+                if isinstance(value, (float, np.floating))
+                else int(value)
+                if isinstance(value, (int, np.integer))
+                else value
+            )
+            for key, value in optuna_params.items()
+        }
 
     metrics = {
         "catboost": cat_metrics,
