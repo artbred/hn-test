@@ -9,6 +9,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
+from models.nn_head import NeuralHeadConfig, train_neural_head
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -16,6 +18,7 @@ from sklearn.metrics import (
     precision_recall_curve,
     roc_auc_score,
 )
+from sklearn.preprocessing import StandardScaler
 
 from features import DatasetBundle, FeatureEngineer, load_raw_posts
 
@@ -107,15 +110,17 @@ def build_catboost_classifier(
     class_weights: List[float], **overrides
 ) -> CatBoostClassifier:
     params = {
-        "depth": 8,
-        "learning_rate": 0.08,
+        "depth": 6,
+        "learning_rate": 0.015,
         "iterations": 600,
+        "bagging_temperature": 4.31,
+        "random_strength": 1.23,
         "loss_function": "Logloss",
         "eval_metric": "AUC",
         "random_seed": 42,
         "early_stopping_rounds": 50,
-        "l2_leaf_reg": 5.0,
-        "border_count": 254,
+        "l2_leaf_reg": 6.45,
+        "border_count": 64,
         "class_weights": list(class_weights),
         "use_best_model": True,
         "verbose": 100,
@@ -150,14 +155,11 @@ def save_metrics(path: Path, metrics: Dict[str, Dict[str, float]]) -> None:
 def save_predictions(
     path: Path,
     ids: pd.Series,
-    cat_probs: np.ndarray,
+    prob_columns: Dict[str, np.ndarray],
 ) -> None:
-    frame = pd.DataFrame(
-        {
-            "id": ids,
-            "catboost_prob": cat_probs,
-        }
-    )
+    frame = pd.DataFrame({"id": ids})
+    for name, values in prob_columns.items():
+        frame[name] = values
     frame.to_csv(path, index=False)
 
 
@@ -215,6 +217,39 @@ def tune_threshold(
         "threshold_precision": float(precision[best_idx]),
         "threshold_recall": float(recall[best_idx]),
     }
+
+
+def select_dense_feature_columns(df: pd.DataFrame) -> List[str]:
+    """Return columns safe for dense models (numeric only)."""
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    if not numeric_cols:
+        raise ValueError("No numeric feature columns available for dense models.")
+    return numeric_cols
+
+
+def dense_matrix(df: pd.DataFrame, columns: List[str]) -> np.ndarray:
+    return df[columns].astype(np.float32).values
+
+
+def summarize_model_metrics(
+    y_true: pd.Series,
+    probs: np.ndarray,
+    strategy: str,
+    target_recall: float,
+) -> Tuple[float, Dict[str, float]]:
+    threshold, stats = tune_threshold(
+        y_true,
+        probs,
+        strategy=strategy,
+        target_recall=target_recall,
+    )
+    metrics = evaluate_metrics(y_true, probs, threshold=threshold)
+    metrics["decision_threshold"] = float(threshold)
+    metrics["threshold_strategy"] = strategy
+    if strategy == "precision_at_recall":
+        metrics["target_recall"] = float(target_recall)
+    metrics.update(stats)
+    return threshold, metrics
 
 
 def run_optuna_search(
@@ -312,6 +347,13 @@ def main() -> None:
         for col in ["type", "domain", "by"]
         if col in splits["X_train"].columns
     ]
+    dense_feature_cols = select_dense_feature_columns(splits["X_train"])
+    X_train_dense = dense_matrix(splits["X_train"], dense_feature_cols)
+    X_valid_dense = dense_matrix(splits["X_valid"], dense_feature_cols)
+    y_train_array = splits["y_train"].astype(np.float32).values
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_dense)
+    X_valid_scaled = scaler.transform(X_valid_dense)
 
     optuna_params: Dict[str, float | int] = {}
     if args.optuna_trials > 0:
@@ -344,24 +386,52 @@ def main() -> None:
     )
     cat_valid_probs = cat_model.predict_proba(splits["X_valid"])[:, 1]
 
-    tuned_threshold, tuning_stats = tune_threshold(
-        splits["y_valid"],
-        cat_valid_probs,
-        strategy=args.threshold_strategy,
-        target_recall=args.target_recall,
+    logreg_model = LogisticRegression(
+        max_iter=3000,
+        class_weight="balanced",
+        solver="lbfgs",
     )
-    cat_metrics = evaluate_metrics(
-        splits["y_valid"], cat_valid_probs, threshold=tuned_threshold
+    logreg_model.fit(X_train_scaled, splits["y_train"])
+    logreg_valid_probs = logreg_model.predict_proba(X_valid_scaled)[:, 1]
+
+    nn_config = NeuralHeadConfig()
+    _, nn_valid_probs = train_neural_head(
+        X_train_scaled,
+        y_train_array,
+        X_valid_scaled,
+        config=nn_config,
     )
-    cat_metrics["decision_threshold"] = float(tuned_threshold)
-    cat_metrics["threshold_strategy"] = args.threshold_strategy
-    if args.threshold_strategy == "precision_at_recall":
-        cat_metrics["target_recall"] = float(args.target_recall)
-    cat_metrics.update(tuning_stats)
+    meta_features = np.stack(
+        [cat_valid_probs, nn_valid_probs, logreg_valid_probs], axis=1
+    )
+    meta_model = LogisticRegression(
+        max_iter=2000,
+        class_weight="balanced",
+        solver="lbfgs",
+    )
+    meta_model.fit(meta_features, splits["y_valid"])
+    ensemble_probs = meta_model.predict_proba(meta_features)[:, 1]
+
+    metrics = {}
+    y_valid = splits["y_valid"]
+    for name, probs in [
+        ("catboost", cat_valid_probs),
+        ("neural_head", nn_valid_probs),
+        ("logistic_regression", logreg_valid_probs),
+        ("stacked_ensemble", ensemble_probs),
+    ]:
+        _, model_metrics = summarize_model_metrics(
+            y_valid,
+            probs,
+            strategy=args.threshold_strategy,
+            target_recall=args.target_recall,
+        )
+        metrics[name] = model_metrics
+
     if args.optuna_trials > 0 and optuna_params:
-        cat_metrics["optuna_trials"] = int(args.optuna_trials)
-        cat_metrics["optuna_metric"] = args.optuna_metric
-        cat_metrics["optuna_best_params"] = {
+        metrics["catboost"]["optuna_trials"] = int(args.optuna_trials)
+        metrics["catboost"]["optuna_metric"] = args.optuna_metric
+        metrics["catboost"]["optuna_best_params"] = {
             key: (
                 float(value)
                 if isinstance(value, (float, np.floating))
@@ -372,16 +442,21 @@ def main() -> None:
             for key, value in optuna_params.items()
         }
 
-    metrics = {
-        "catboost": cat_metrics,
-    }
-
     metrics_path = args.reports_dir / "metrics.json"
     preds_path = args.reports_dir / "validation_predictions.csv"
     cat_imp_path = args.reports_dir / "catboost_feature_importance.csv"
 
     save_metrics(metrics_path, metrics)
-    save_predictions(preds_path, splits["ids_valid"], cat_valid_probs)
+    save_predictions(
+        preds_path,
+        splits["ids_valid"],
+        {
+            "catboost_prob": cat_valid_probs,
+            "nn_prob": nn_valid_probs,
+            "logreg_prob": logreg_valid_probs,
+            "ensemble_prob": ensemble_probs,
+        },
+    )
     save_feature_importance(cat_model, cat_imp_path, cat_features=list(splits["X_train"].columns))
 
     print(f"Artifacts saved under {args.reports_dir}")
