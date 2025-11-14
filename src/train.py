@@ -16,13 +16,6 @@ from sklearn.metrics import (
     precision_recall_curve,
     roc_auc_score,
 )
-from sklearn.neural_network import MLPClassifier
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-
-from imblearn.combine import SMOTETomek
-from imblearn.over_sampling import SMOTENC
-from joblib import dump
 
 from features import DatasetBundle, FeatureEngineer, load_raw_posts
 
@@ -329,106 +322,6 @@ def run_optuna_search(
     return study.best_params
 
 
-def _encode_categorical(
-    df: pd.DataFrame, categorical_cols: List[str]
-) -> Tuple[pd.DataFrame, Dict[str, pd.Index]]:
-    encoded = df.copy()
-    mappings: Dict[str, pd.Index] = {}
-    for col in categorical_cols:
-        if col not in encoded.columns:
-            continue
-        encoded[col] = encoded[col].astype("category")
-        mappings[col] = encoded[col].cat.categories
-        encoded[col] = encoded[col].cat.codes.astype(np.int32)
-    return encoded, mappings
-
-
-def _decode_categorical(
-    df: pd.DataFrame, mappings: Dict[str, pd.Index]
-) -> pd.DataFrame:
-    decoded = df.copy()
-    for col, categories in mappings.items():
-        if col not in decoded.columns:
-            continue
-        codes = decoded[col].round().astype(int)
-        codes = codes.clip(lower=0, upper=len(categories) - 1)
-        decoded[col] = categories.take(codes).astype(object)
-    return decoded
-
-
-def apply_smote_tomek(
-    X: pd.DataFrame,
-    y: pd.Series,
-    categorical_cols: List[str],
-    random_state: int = 42,
-) -> Tuple[pd.DataFrame, pd.Series]:
-    encoded_X, mappings = _encode_categorical(X, categorical_cols)
-    categorical_idx = [
-        encoded_X.columns.get_loc(col)
-        for col in categorical_cols
-        if col in encoded_X.columns
-    ]
-    smote = SMOTENC(
-        categorical_features=categorical_idx,
-        random_state=random_state,
-    )
-    combo = SMOTETomek(smote=smote, random_state=random_state)
-    X_resampled, y_resampled = combo.fit_resample(encoded_X.values, y.values)
-    X_res_df = pd.DataFrame(X_resampled, columns=encoded_X.columns)
-    X_res_df = _decode_categorical(X_res_df, mappings)
-    for col in X.columns:
-        if col in categorical_cols:
-            continue
-        X_res_df[col] = X_res_df[col].astype(X[col].dtype)
-    y_res_series = pd.Series(y_resampled, name=y.name).astype(y.dtype)
-    return X_res_df, y_res_series
-
-
-def apply_smote_tomek_dense(
-    X: pd.DataFrame, y: pd.Series, random_state: int = 42
-) -> Tuple[pd.DataFrame, pd.Series]:
-    combo = SMOTETomek(random_state=random_state)
-    X_resampled, y_resampled = combo.fit_resample(X.values, y.values)
-    X_res_df = pd.DataFrame(X_resampled, columns=X.columns)
-    for col in X.columns:
-        X_res_df[col] = X_res_df[col].astype(X[col].dtype)
-    y_res_series = pd.Series(y_resampled, name=y.name).astype(y.dtype)
-    return X_res_df, y_res_series
-
-
-def train_embedding_mlp(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_valid: pd.DataFrame,
-) -> Tuple[Pipeline, np.ndarray]:
-    if X_train is None or X_valid is None:
-        raise ValueError("Embedding feature splits are required for MLP training.")
-    if X_train.empty or X_valid.empty:
-        raise ValueError("Embedding feature splits must be non-empty.")
-    pipeline = Pipeline(
-        steps=[
-            ("scaler", StandardScaler()),
-            (
-                "mlp",
-                MLPClassifier(
-                    hidden_layer_sizes=(128, 64),
-                    activation="relu",
-                    alpha=1e-4,
-                    batch_size=256,
-                    learning_rate_init=1e-3,
-                    max_iter=50,
-                    early_stopping=True,
-                    n_iter_no_change=5,
-                    validation_fraction=0.1,
-                    random_state=42,
-                    verbose=False,
-                ),
-            ),
-        ]
-    )
-    pipeline.fit(X_train.values, y_train)
-    valid_probs = pipeline.predict_proba(X_valid.values)[:, 1]
-    return pipeline, valid_probs
 
 
 def main() -> None:
@@ -477,58 +370,20 @@ def main() -> None:
         **optuna_params,
     )
 
-    print("Applying SMOTE-Tomek to CatBoost training data...")
-    smote_train_X, smote_train_y = apply_smote_tomek(
-        splits["X_train"],
-        splits["y_train"],
-        categorical_cols=["domain", "by"],
-        random_state=42,
-    )
-
     print("Training CatBoost...")
     cat_model.fit(
-        smote_train_X,
-        smote_train_y,
+        splits["X_train"],
+        splits["y_train"],
         cat_features=cat_feature_idx,
         eval_set=(splits["X_valid"], splits["y_valid"]),
+        verbose=False,
     )
     cat_valid_probs = cat_model.predict_proba(splits["X_valid"])[:, 1]
-
-
-    embedding_train = splits.get("E_train")
-    embedding_valid = splits.get("E_valid")
-    mlp_model = None
-    mlp_valid_probs = None
-    if (
-        isinstance(embedding_train, pd.DataFrame)
-        and isinstance(embedding_valid, pd.DataFrame)
-    ):
-        if embedding_train.empty or embedding_valid.empty:
-            print("Skipping embedding MLP training because embedding features are empty.")
-        else:
-            print("Applying SMOTE-Tomek to embedding training data...")
-            smote_embed_X, smote_embed_y = apply_smote_tomek_dense(
-                embedding_train,
-                splits["y_train"],
-                random_state=42,
-            )
-            print("Training embedding MLP on title embeddings...")
-            mlp_model, mlp_valid_probs = train_embedding_mlp(
-                smote_embed_X,
-                smote_embed_y,
-                embedding_valid,
-            )
-            mlp_path = args.reports_dir / "mlp_title_embeddings.joblib"
-            dump(mlp_model, mlp_path)
-            print(f"Saved embedding MLP model to {mlp_path}")
 
     metrics = {}
     y_valid = splits["y_valid"]
     prob_sources = {"catboost": cat_valid_probs}
-    if mlp_valid_probs is not None:
-        prob_sources["embedding_mlp"] = mlp_valid_probs
-        prob_sources["ensemble_mean"] = (cat_valid_probs + mlp_valid_probs) / 2.0
-
+   
     for name, probs in prob_sources.items():
         _, model_metrics = summarize_model_metrics(
             y_valid,

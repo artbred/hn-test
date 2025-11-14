@@ -297,8 +297,8 @@ class FeatureEngineer:
             "user_domain_mean_score",
             "user_domain_max_score",
         ]
-        categorical = ["domain", "by"]
-        return base_cols + categorical
+        categorical = ["by"]
+        return base_cols + categorical + self._title_embedding_cols
 
     def _finalize_feature_dtypes(self, features: pd.DataFrame) -> None:
         for col in features.select_dtypes(include=["float64"]).columns:
