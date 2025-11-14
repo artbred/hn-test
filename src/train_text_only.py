@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--embedding-batch-size",
         type=int,
-        default=64,
+        default=128,
         help="Batch size for embedding inference.",
     )
     parser.add_argument(
@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=64,
+        default=256,
         help="Batch size for classifier fine-tuning.",
     )
     parser.add_argument(
@@ -134,22 +134,60 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Whether to enable trust_remote_code when loading the embedding model.",
     )
-    parser.add_argument(
-        "--n-rows",
-        type=int,
-        default=None,
-        help="If provided, limit the loaded dataset to the first n rows.",
-    )
     return parser.parse_args()
 
 
-def prepare_formatted_text(df: pd.DataFrame) -> List[str]:
+def build_user_stats(df: pd.DataFrame) -> pd.DataFrame:
+    work = df[["by", "time", "is_viral", "score"]].copy()
+    work = work.sort_values("time")
+    grouped = work.groupby("by", sort=False, dropna=False)
+    prior_posts = grouped.cumcount().astype(np.float32)
+    prior_viral = (grouped["is_viral"].cumsum() - work["is_viral"]).astype(np.float32)
+    prior_scores = (grouped["score"].cumsum() - work["score"]).astype(np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mean_score = prior_scores / prior_posts.replace(0, np.nan)
+        viral_rate = prior_viral / prior_posts.replace(0, np.nan)
+    hours_since_last = grouped["time"].diff() / 3600.0
+    stats = pd.DataFrame(
+        {
+            "user_prior_posts": prior_posts,
+            "user_prior_viral": prior_viral,
+            "user_prior_mean_score": mean_score.astype(np.float32),
+            "user_prior_viral_rate": viral_rate.astype(np.float32),
+            "user_hours_since_last": hours_since_last.astype(np.float32),
+        },
+        index=work.index,
+    )
+    stats = stats.reindex(df.index)
+    stats["user_prior_posts"] = stats["user_prior_posts"].fillna(0.0)
+    stats["user_prior_viral"] = stats["user_prior_viral"].fillna(0.0)
+    stats["user_prior_mean_score"] = stats["user_prior_mean_score"].fillna(
+        df["score"].mean()
+    )
+    stats["user_prior_viral_rate"] = stats["user_prior_viral_rate"].fillna(
+        df["is_viral"].mean()
+    )
+    median_hours = stats["user_hours_since_last"].median()
+    stats["user_hours_since_last"] = stats["user_hours_since_last"].fillna(
+        24.0 if np.isnan(median_hours) else float(median_hours)
+    )
+    return stats
+
+
+def prepare_formatted_text(
+    df: pd.DataFrame, user_stats: pd.DataFrame | None = None
+) -> List[str]:
     titles = df["title"].fillna("").astype(str)
     users = df["by"].fillna("unknown").astype(str)
     urls = df["url"].fillna("").astype(str)
     texts = df.get("text", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str)
+    stats_records = None
+    if user_stats is not None:
+        stats_records = user_stats.reindex(df.index).to_dict("records")
     formatted = []
-    for title, user, url, text in zip(titles, users, urls, texts, strict=False):
+    for idx, (title, user, url, text) in enumerate(
+        zip(titles, users, urls, texts, strict=False)
+    ):
         lines = [
             f"Title: {title.strip()}",
             f"User: {user.strip()}",
@@ -157,6 +195,16 @@ def prepare_formatted_text(df: pd.DataFrame) -> List[str]:
         ]
         if text:
             lines.append(f"Text: {text.strip()}")
+        if stats_records is not None:
+            record = stats_records[idx]
+            lines.append(
+                "UserStats: "
+                f"prior_posts={int(record['user_prior_posts'])}; "
+                f"prior_viral={int(record['user_prior_viral'])}; "
+                f"viral_rate={record['user_prior_viral_rate']:.2f}; "
+                f"mean_score={record['user_prior_mean_score']:.1f}; "
+                f"hours_since_last={record['user_hours_since_last']:.1f}"
+            )
         formatted.append("\n".join(lines))
     return formatted
 
@@ -214,13 +262,21 @@ class TrainerConfig:
     dropout: float
 
 
+def resolve_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def train_text_head(
     X_train: np.ndarray,
     y_train: np.ndarray,
     X_valid: np.ndarray,
     config: TrainerConfig,
 ) -> Tuple[TextHead, np.ndarray]:
-    device = torch.device("cuda" if torch.cuda.is_available() else "mps")
+    device = resolve_device()
     model = TextHead(
         input_dim=X_train.shape[1],
         hidden_dim=config.hidden_dim,
@@ -346,7 +402,7 @@ def save_predictions(
 def main() -> None:
     args = parse_args()
     args.reports_dir.mkdir(parents=True, exist_ok=True)
-    raw = load_raw_posts(args.data_path, n_rows=args.n_rows)
+    raw = load_raw_posts(args.data_path)
     raw["title"] = raw["title"].fillna("")
     raw["by"] = raw["by"].fillna("unknown")
     raw["url"] = raw["url"].fillna("")
@@ -355,7 +411,8 @@ def main() -> None:
         pd.Series([""] * len(raw), index=raw.index),
     ).fillna("")
     raw["is_viral"] = (raw["score"] > args.viral_threshold).astype(np.int32)
-    formatted_inputs = prepare_formatted_text(raw)
+    user_stats = build_user_stats(raw)
+    formatted_inputs = prepare_formatted_text(raw, user_stats=user_stats)
     embeddings = compute_sentence_embeddings(
         formatted_inputs,
         model_name=args.embedding_model,
