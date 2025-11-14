@@ -292,13 +292,11 @@ class FeatureEngineer:
             "posted_dayofweek",
             "user_avg_score",
             "user_mean_score",
-            "user_max_score",
             "user_domain_avg_score",
             "user_domain_mean_score",
-            "user_domain_max_score",
         ]
         categorical = ["by", "domain"]
-        return base_cols + categorical + self._title_embedding_cols
+        return base_cols + categorical
 
     def _finalize_feature_dtypes(self, features: pd.DataFrame) -> None:
         for col in features.select_dtypes(include=["float64"]).columns:

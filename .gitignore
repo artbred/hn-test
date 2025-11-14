@@ -12,6 +12,7 @@ develop-eggs/
 dist/
 downloads/
 reports/*
+.cog
 eggs/
 *.joblib
 .venv
