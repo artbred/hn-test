@@ -297,7 +297,7 @@ class FeatureEngineer:
             "user_domain_mean_score",
             "user_domain_max_score",
         ]
-        categorical = ["by"]
+        categorical = ["by", "domain"]
         return base_cols + categorical + self._title_embedding_cols
 
     def _finalize_feature_dtypes(self, features: pd.DataFrame) -> None:
@@ -312,8 +312,8 @@ class FeatureEngineer:
         parsed = self._extractor(url)
         if parsed.domain and parsed.suffix:
             return f"{parsed.domain}.{parsed.suffix}".lower()
-        netloc = urlparse(url).netloc.lower()
-        return netloc or "unknown"
+        netloc = urlparse(url).netloc.lower().removeprefix("www.")
+        return netloc.replace(".", "_") or "unknown"
 
     @staticmethod
     def _path_depth(url: str) -> int:
