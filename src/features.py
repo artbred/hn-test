@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
 import tldextract
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import StandardScaler
 
 from embeddings import compute_sentence_embeddings
 
@@ -39,7 +41,9 @@ class FeatureEngineer:
         title_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         title_embedding_cache_path: str | Path | None = None,
         title_embedding_batch_size: int = 256,
-        title_embedding_normalize: bool = False,
+        title_embedding_normalize: bool = True,
+        title_embedding_dim: int | None = 32,
+        title_embedding_scale: bool = True,
     ) -> None:
         self.viral_threshold = viral_threshold
         self._extractor = tldextract.TLDExtract(include_psl_private_domains=True)
@@ -51,6 +55,8 @@ class FeatureEngineer:
         )
         self.title_embedding_batch_size = title_embedding_batch_size
         self.title_embedding_normalize = title_embedding_normalize
+        self.title_embedding_dim = title_embedding_dim
+        self.title_embedding_scale = title_embedding_scale
         self._title_embedding_cols: List[str] = []
 
     def transform(self, df: pd.DataFrame) -> DatasetBundle:
@@ -197,7 +203,7 @@ class FeatureEngineer:
         return mask
 
 
-    def _add_title_embeddings(self, df: pd.DataFrame) -> tuple[pd.DataFrame, List[str]]:
+    def _add_title_embeddings(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
         if not self.title_embedding_model:
             return df, []
 
@@ -214,10 +220,22 @@ class FeatureEngineer:
                 f"{embeddings.shape[0]} vs {len(df)}"
             )
 
-        col_names = [f"title_emb_{i:03d}" for i in range(embeddings.shape[1])]
-        embedding_df = pd.DataFrame(
-            embeddings.astype(np.float32), columns=col_names, index=df.index
-        )
+        matrix = embeddings.astype(np.float32)
+
+        if self.title_embedding_scale:
+            scaler = StandardScaler()
+            matrix = scaler.fit_transform(matrix).astype(np.float32)
+
+        reduced_dim = self.title_embedding_dim
+        if reduced_dim is not None and reduced_dim < matrix.shape[1]:
+            reducer = TruncatedSVD(
+                n_components=reduced_dim,
+                random_state=42,
+            )
+            matrix = reducer.fit_transform(matrix).astype(np.float32)
+
+        col_names = [f"title_emb_{i:03d}" for i in range(matrix.shape[1])]
+        embedding_df = pd.DataFrame(matrix, columns=col_names, index=df.index)
         df = df.join(embedding_df)
         return df, col_names
 

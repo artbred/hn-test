@@ -177,7 +177,9 @@ def tune_threshold(
 
     if strategy == "f1":
         denom = precision + recall
-        f1 = np.where(denom > 0, 2 * (precision * recall) / denom, 0.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            f1 = np.where(denom > 0, 2 * (precision * recall) / denom, 0.0)
+        f1 = np.nan_to_num(f1, nan=0.0, posinf=0.0, neginf=0.0)
         best_idx = int(np.nanargmax(f1))
         return thresholds[best_idx], {
             "threshold_precision": float(precision[best_idx]),

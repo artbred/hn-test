@@ -1,0 +1,28 @@
+{ -- no emb
+  "catboost": {
+    "roc_auc": 0.6810069141820085,
+    "pr_auc": 0.11265697715579269,
+    "f1": 0.18210609659540775,
+    "accuracy": 0.8967,
+    "decision_threshold": 0.572155944022096,
+    "threshold_strategy": "f1",
+    "threshold_precision": 0.14465408805031446,
+    "threshold_recall": 0.24572649572649571,
+    "threshold_f1": 0.18210609659540777
+  }
+}
+
+
+{
+  "catboost": {
+    "roc_auc": 0.7130834149298271,
+    "pr_auc": 0.11634455916491379,
+    "f1": 0.1841779975278121,
+    "accuracy": 0.868,
+    "decision_threshold": 0.5756495210979037,
+    "threshold_strategy": "f1",
+    "threshold_precision": 0.12956521739130436,
+    "threshold_recall": 0.31837606837606836,
+    "threshold_f1": 0.18417799752781214
+  }
+}
