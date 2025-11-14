@@ -9,7 +9,6 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
-from models.nn_head import NeuralHeadConfig, train_neural_head
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
@@ -329,13 +328,15 @@ def main() -> None:
     args = parse_args()
     args.reports_dir.mkdir(parents=True, exist_ok=True)
 
+    viral_threshold = 250
+
     raw = load_raw_posts(args.data_path, n_rows=args.n_rows)
     print(f"Loaded {len(raw):,} posts with columns: {list(raw.columns)}")
-    viral_rate = (raw["score"] > 500).mean()
-    print(f"Baseline viral rate (>500 score): {viral_rate:.2%}")
+    viral_rate = (raw["score"] > viral_threshold).mean()
+    print(f"Baseline viral rate (>={viral_threshold} score): {viral_rate:.2%}")
 
     engineer = FeatureEngineer(
-        viral_threshold=500,
+        viral_threshold=viral_threshold,
         title_embedding_cache_path=args.title_embedding_cache,
     )
     bundle = engineer.transform(raw)
@@ -348,12 +349,6 @@ def main() -> None:
         if col in splits["X_train"].columns
     ]
     dense_feature_cols = select_dense_feature_columns(splits["X_train"])
-    X_train_dense = dense_matrix(splits["X_train"], dense_feature_cols)
-    X_valid_dense = dense_matrix(splits["X_valid"], dense_feature_cols)
-    y_train_array = splits["y_train"].astype(np.float32).values
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_dense)
-    X_valid_scaled = scaler.transform(X_valid_dense)
 
     optuna_params: Dict[str, float | int] = {}
     if args.optuna_trials > 0:
@@ -386,39 +381,11 @@ def main() -> None:
     )
     cat_valid_probs = cat_model.predict_proba(splits["X_valid"])[:, 1]
 
-    logreg_model = LogisticRegression(
-        max_iter=3000,
-        class_weight="balanced",
-        solver="lbfgs",
-    )
-    logreg_model.fit(X_train_scaled, splits["y_train"])
-    logreg_valid_probs = logreg_model.predict_proba(X_valid_scaled)[:, 1]
-
-    nn_config = NeuralHeadConfig()
-    _, nn_valid_probs = train_neural_head(
-        X_train_scaled,
-        y_train_array,
-        X_valid_scaled,
-        config=nn_config,
-    )
-    meta_features = np.stack(
-        [cat_valid_probs, nn_valid_probs, logreg_valid_probs], axis=1
-    )
-    meta_model = LogisticRegression(
-        max_iter=2000,
-        class_weight="balanced",
-        solver="lbfgs",
-    )
-    meta_model.fit(meta_features, splits["y_valid"])
-    ensemble_probs = meta_model.predict_proba(meta_features)[:, 1]
 
     metrics = {}
     y_valid = splits["y_valid"]
     for name, probs in [
         ("catboost", cat_valid_probs),
-        ("neural_head", nn_valid_probs),
-        ("logistic_regression", logreg_valid_probs),
-        ("stacked_ensemble", ensemble_probs),
     ]:
         _, model_metrics = summarize_model_metrics(
             y_valid,
@@ -451,10 +418,7 @@ def main() -> None:
         preds_path,
         splits["ids_valid"],
         {
-            "catboost_prob": cat_valid_probs,
-            "nn_prob": nn_valid_probs,
-            "logreg_prob": logreg_valid_probs,
-            "ensemble_prob": ensemble_probs,
+            "catboost_prob": cat_valid_probs
         },
     )
     save_feature_importance(cat_model, cat_imp_path, cat_features=list(splits["X_train"].columns))
