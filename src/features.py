@@ -56,16 +56,26 @@ class FeatureEngineer:
     def transform(self, df: pd.DataFrame) -> DatasetBundle:
         work = df.copy()
         work["is_viral"] = (work["score"] > self.viral_threshold).astype(np.int8)
+        work["is_top_1pct"] = self._mark_top_fraction(
+            scores=work["score"], fraction=0.01
+        )
         work["title"] = work["title"].fillna("")
         work["url"] = work["url"].fillna("")
         work["text"] = work["text"].fillna("")
 
         work = self._add_temporal_features(work)
         work = self._add_url_features(work)
-        self._title_embedding_cols = self._add_title_embeddings(work)
+        work = work.copy()
+        work, self._title_embedding_cols = self._add_title_embeddings(work)
 
         work = self._add_historical_features(work, group_col="domain", prefix="domain")
-        work = self._add_historical_features(work, group_col="by", prefix="user")
+        work = self._add_historical_features(
+            work,
+            group_col="by",
+            prefix="user",
+            top_flag_col="is_top_1pct",
+            top_flag_output="user_prior_top1pct_count",
+        )
 
         feature_cols = self._select_feature_columns(work)
         features = work[feature_cols].copy()
@@ -101,9 +111,17 @@ class FeatureEngineer:
 
 
     def _add_historical_features(
-        self, df: pd.DataFrame, group_col: str, prefix: str
+        self,
+        df: pd.DataFrame,
+        group_col: str,
+        prefix: str,
+        top_flag_col: str | None = None,
+        top_flag_output: str | None = None,
     ) -> pd.DataFrame:
-        working = df[[group_col, "time", "is_viral", "score"]].copy()
+        cols = [group_col, "time", "is_viral", "score"]
+        if top_flag_col and top_flag_col not in cols:
+            cols.append(top_flag_col)
+        working = df[cols].copy()
         working = working.sort_values("time")
         grouped = working.groupby(group_col, sort=False, dropna=False)
 
@@ -112,18 +130,21 @@ class FeatureEngineer:
         prior_scores = grouped["score"].cumsum() - working["score"]
         prior_hours = grouped["time"].diff() / 3600.0
 
-        stats = pd.DataFrame(
-            {
-                f"{prefix}_prior_posts": prior_posts,
-                f"{prefix}_prior_viral_count": prior_viral,
-                f"{prefix}_prior_mean_score": prior_scores
-                / prior_posts.replace(0, np.nan),
-                f"{prefix}_prior_viral_rate": prior_viral
-                / prior_posts.replace(0, np.nan),
-                f"{prefix}_hours_since_last": prior_hours,
-            },
-            index=working.index,
+        data = {
+            f"{prefix}_prior_posts": prior_posts,
+            f"{prefix}_prior_viral_count": prior_viral,
+            f"{prefix}_prior_mean_score": prior_scores / prior_posts.replace(0, np.nan),
+            f"{prefix}_prior_viral_rate": prior_viral / prior_posts.replace(0, np.nan),
+            f"{prefix}_hours_since_last": prior_hours,
+        }
+        top_flag_feature = top_flag_output or (
+            f"{prefix}_prior_top_flag_count" if top_flag_col else None
         )
+        if top_flag_col and top_flag_feature:
+            prior_top_flag = grouped[top_flag_col].cumsum() - working[top_flag_col]
+            data[top_flag_feature] = prior_top_flag
+
+        stats = pd.DataFrame(data, index=working.index)
 
         stats[f"{prefix}_prior_posts"] = stats[f"{prefix}_prior_posts"].astype(
             np.float32
@@ -143,6 +164,8 @@ class FeatureEngineer:
         stats[f"{prefix}_hours_since_last"] = stats[
             f"{prefix}_hours_since_last"
         ].astype(np.float32)
+        if top_flag_feature:
+            stats[top_flag_feature] = stats[top_flag_feature].astype(np.float32)
 
         stats = stats.reindex(df.index)
         overall_viral_rate = df["is_viral"].mean()
@@ -159,14 +182,24 @@ class FeatureEngineer:
         stats[f"{prefix}_hours_since_last"] = stats[f"{prefix}_hours_since_last"].fillna(
             median_hours
         )
+        if top_flag_feature:
+            stats[top_flag_feature] = stats[top_flag_feature].fillna(0.0)
 
-        for col in stats.columns:
-            df[col] = stats[col]
-        return df
+        return df.join(stats, how="left")
+        
+    def _mark_top_fraction(self, scores: pd.Series, fraction: float) -> pd.Series:
+        if scores.empty:
+            return pd.Series(np.zeros(0, dtype=np.int8), index=scores.index)
+        top_k = max(int(np.ceil(len(scores) * fraction)), 1)
+        top_scores = scores.nlargest(top_k)
+        threshold = top_scores.min()
+        mask = (scores >= threshold).astype(np.int8)
+        return mask
 
-    def _add_title_embeddings(self, df: pd.DataFrame) -> List[str]:
+
+    def _add_title_embeddings(self, df: pd.DataFrame) -> tuple[pd.DataFrame, List[str]]:
         if not self.title_embedding_model:
-            return []
+            return df, []
 
         embeddings = compute_sentence_embeddings(
             texts=df["title"].tolist(),
@@ -182,8 +215,11 @@ class FeatureEngineer:
             )
 
         col_names = [f"title_emb_{i:03d}" for i in range(embeddings.shape[1])]
-        df[col_names] = embeddings.astype(np.float32)
-        return col_names
+        embedding_df = pd.DataFrame(
+            embeddings.astype(np.float32), columns=col_names, index=df.index
+        )
+        df = df.join(embedding_df)
+        return df, col_names
 
     def _select_feature_columns(self, df: pd.DataFrame) -> List[str]:
         base_cols = [
@@ -207,6 +243,7 @@ class FeatureEngineer:
             "user_prior_mean_score",
             "user_prior_viral_rate",
             "user_hours_since_last",
+            "user_prior_top1pct_count",
         ]
         categorical = ["domain", "by"]
         return base_cols + self._title_embedding_cols + categorical
