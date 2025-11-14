@@ -13,6 +13,10 @@ def compute_sentence_embeddings(
     batch_size: int = 256,
     cache_path: Path | None = None,
     normalize: bool = False,
+    *,
+    trust_remote_code: bool = False,
+    device: str | None = None,
+    max_seq_length: int | None = None,
 ) -> np.ndarray:
     """Compute (or load cached) sentence embeddings for the provided texts."""
     texts_list = list(texts)
@@ -24,7 +28,20 @@ def compute_sentence_embeddings(
                 return cached
             cache_path.unlink()
 
-    model = SentenceTransformer(model_name)
+    model = SentenceTransformer(
+        model_name,
+        trust_remote_code=trust_remote_code,
+        device=device,
+    )
+    if max_seq_length is not None:
+        try:
+            model.max_seq_length = max_seq_length
+        except AttributeError:
+            pass
+        tokenizer = getattr(model, "tokenizer", None)
+        if tokenizer is not None:
+            tokenizer.model_max_length = max_seq_length
+            tokenizer.init_kwargs["model_max_length"] = max_seq_length
     embeddings = model.encode(
         texts_list,
         batch_size=batch_size,
