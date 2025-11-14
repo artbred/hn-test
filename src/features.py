@@ -17,9 +17,9 @@ class DatasetBundle:
     ids: pd.Series
 
 
-def load_raw_posts(csv_path: Path) -> pd.DataFrame:
+def load_raw_posts(csv_path: Path, n_rows: int | None = None) -> pd.DataFrame:
     """Load the Hacker News posts CSV."""
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, nrows=n_rows)
     expected = {"id", "title", "url", "type", "by", "time", "score"}
     missing = expected.difference(df.columns)
     if missing:
@@ -42,9 +42,7 @@ class FeatureEngineer:
         work["text"] = work["text"].fillna("")
 
         work = self._add_temporal_features(work)
-        work = self._add_title_features(work)
         work = self._add_url_features(work)
-        work = self._add_text_features(work)
 
         work = self._add_historical_features(work, group_col="domain", prefix="domain")
         work = self._add_historical_features(work, group_col="by", prefix="user")
@@ -61,33 +59,6 @@ class FeatureEngineer:
         posted_at = pd.to_datetime(df["time"], unit="s", utc=True)
         df["posted_hour"] = posted_at.dt.hour.astype(np.int8)
         df["posted_dayofweek"] = posted_at.dt.dayofweek.astype(np.int8)
-        df["posted_month"] = posted_at.dt.month.astype(np.int8)
-        df["is_weekend"] = posted_at.dt.dayofweek.isin([5, 6]).astype(np.int8)
-        df["is_night"] = posted_at.dt.hour.isin(list(range(0, 6))).astype(np.int8)
-        df["post_timestamp_days"] = (
-            (df["time"] - df["time"].min()) / 86400.0
-        ).astype(np.float32)
-        return df
-
-    def _add_title_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        df["title_char_len"] = df["title"].str.len().astype(np.int32)
-        df["title_word_count"] = (
-            df["title"].str.split().str.len().fillna(0).astype(np.int16)
-        )
-        df["title_avg_word_len"] = (
-            df["title_char_len"] / df["title_word_count"].replace(0, np.nan)
-        ).fillna(0).astype(np.float32)
-        df["title_caps_share"] = (
-            df["title"].str.count(r"[A-Z]") / df["title_char_len"].replace(0, np.nan)
-        ).fillna(0).astype(np.float32)
-        df["title_punct_share"] = (
-            df["title"].str.count(r"[!-/:-@[-`{-~]")
-            / df["title_char_len"].replace(0, np.nan)
-        ).fillna(0).astype(np.float32)
-        df["title_has_question"] = df["title"].str.contains(r"\?", regex=True).astype(
-            np.int8
-        )
-        df["title_has_exclaim"] = df["title"].str.contains("!").astype(np.int8)
         return df
 
     def _add_url_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -188,7 +159,7 @@ class FeatureEngineer:
             "user_prior_viral_rate",
             "user_hours_since_last",
         ]
-        categorical = ["type", "domain", "by"]
+        categorical = ["domain", "by"]
         return base_cols + categorical
 
     def _finalize_feature_dtypes(self, features: pd.DataFrame) -> None:

@@ -30,6 +30,12 @@ def parse_args() -> argparse.Namespace:
         help="Absolute path to the hn_posts.csv file.",
     )
     parser.add_argument(
+        "--n-rows",
+        type=int,
+        default=None,
+        help="If provided, limit the loaded dataset to the first N rows.",
+    )
+    parser.add_argument(
         "--reports-dir",
         type=Path,
         default=repo_root / "reports",
@@ -155,7 +161,7 @@ def main() -> None:
     args = parse_args()
     args.reports_dir.mkdir(parents=True, exist_ok=True)
 
-    raw = load_raw_posts(args.data_path)
+    raw = load_raw_posts(args.data_path, n_rows=args.n_rows)
     print(f"Loaded {len(raw):,} posts with columns: {list(raw.columns)}")
     viral_rate = (raw["score"] > 500).mean()
     print(f"Baseline viral rate (>500 score): {viral_rate:.2%}")
