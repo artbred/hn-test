@@ -1,3 +1,0 @@
-save metrics as pickle to load on inference
-focal loss? remove
-add more user based metrics
