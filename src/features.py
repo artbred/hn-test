@@ -8,10 +8,10 @@ from urllib.parse import urlparse
 import numpy as np
 import pandas as pd
 import tldextract
-from sklearn.decomposition import TruncatedSVD
-from sklearn.preprocessing import StandardScaler
+# from sklearn.decomposition import TruncatedSVD
+# from sklearn.preprocessing import StandardScaler
 
-from embeddings import compute_sentence_embeddings
+# from embeddings import compute_sentence_embeddings
 
 
 @dataclass
@@ -73,7 +73,7 @@ class FeatureEngineer:
         work = self._add_temporal_features(work)
         work = self._add_url_features(work)
         work = work.copy()
-        work, self._title_embedding_cols = self._add_title_embeddings(work)
+        # work, self._title_embedding_cols = self._add_title_embeddings(work)
 
         work = self._add_historical_features(work, group_col="domain", prefix="domain")
         work = self._add_historical_features(
@@ -250,41 +250,41 @@ class FeatureEngineer:
         return mask
 
 
-    def _add_title_embeddings(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-        if not self.title_embedding_model:
-            return df, []
+    # def _add_title_embeddings(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    #     if not self.title_embedding_model:
+    #         return df, []
 
-        embeddings = compute_sentence_embeddings(
-            texts=df["title"].tolist(),
-            model_name=self.title_embedding_model,
-            batch_size=self.title_embedding_batch_size,
-            cache_path=self.title_embedding_cache_path,
-            normalize=self.title_embedding_normalize,
-        )
-        if embeddings.shape[0] != len(df):
-            raise ValueError(
-                "Embedding row count does not match dataframe length: "
-                f"{embeddings.shape[0]} vs {len(df)}"
-            )
+    #     embeddings = compute_sentence_embeddings(
+    #         texts=df["title"].tolist(),
+    #         model_name=self.title_embedding_model,
+    #         batch_size=self.title_embedding_batch_size,
+    #         cache_path=self.title_embedding_cache_path,
+    #         normalize=self.title_embedding_normalize,
+    #     )
+    #     if embeddings.shape[0] != len(df):
+    #         raise ValueError(
+    #             "Embedding row count does not match dataframe length: "
+    #             f"{embeddings.shape[0]} vs {len(df)}"
+    #         )
 
-        matrix = embeddings.astype(np.float32)
+    #     matrix = embeddings.astype(np.float32)
 
-        if self.title_embedding_scale:
-            scaler = StandardScaler()
-            matrix = scaler.fit_transform(matrix).astype(np.float32)
+    #     if self.title_embedding_scale:
+    #         scaler = StandardScaler()
+    #         matrix = scaler.fit_transform(matrix).astype(np.float32)
 
-        reduced_dim = self.title_embedding_dim
-        if reduced_dim is not None and reduced_dim < matrix.shape[1]:
-            reducer = TruncatedSVD(
-                n_components=reduced_dim,
-                random_state=42,
-            )
-            matrix = reducer.fit_transform(matrix).astype(np.float32)
+    #     reduced_dim = self.title_embedding_dim
+    #     if reduced_dim is not None and reduced_dim < matrix.shape[1]:
+    #         reducer = TruncatedSVD(
+    #             n_components=reduced_dim,
+    #             random_state=42,
+    #         )
+    #         matrix = reducer.fit_transform(matrix).astype(np.float32)
 
-        col_names = [f"title_emb_{i:03d}" for i in range(matrix.shape[1])]
-        embedding_df = pd.DataFrame(matrix, columns=col_names, index=df.index)
-        df = df.join(embedding_df)
-        return df, col_names
+    #     col_names = [f"title_emb_{i:03d}" for i in range(matrix.shape[1])]
+    #     embedding_df = pd.DataFrame(matrix, columns=col_names, index=df.index)
+    #     df = df.join(embedding_df)
+    #     return df, col_names
 
     def _select_feature_columns(self, df: pd.DataFrame) -> List[str]:
         base_cols = [
