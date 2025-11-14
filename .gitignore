@@ -12,6 +12,7 @@ develop-eggs/
 dist/
 downloads/
 eggs/
+*.joblib
 .venv
 .eggs/
 lib/

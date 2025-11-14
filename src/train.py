@@ -9,7 +9,6 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -17,7 +16,11 @@ from sklearn.metrics import (
     precision_recall_curve,
     roc_auc_score,
 )
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+from joblib import dump
 
 from features import DatasetBundle, FeatureEngineer, load_raw_posts
 
@@ -94,15 +97,27 @@ def chronological_split(
     X_sorted = bundle.features.iloc[order].reset_index(drop=True)
     y_sorted = bundle.target.iloc[order].reset_index(drop=True)
     ids_sorted = bundle.ids.iloc[order].reset_index(drop=True)
+    embed_sorted = (
+        bundle.embedding_features.iloc[order].reset_index(drop=True)
+        if isinstance(bundle.embedding_features, pd.DataFrame)
+        else None
+    )
 
     split_idx = int(len(X_sorted) * train_fraction)
-    return {
+    splits: Dict[str, pd.DataFrame | pd.Series] = {
         "X_train": X_sorted.iloc[:split_idx],
         "y_train": y_sorted.iloc[:split_idx],
         "X_valid": X_sorted.iloc[split_idx:],
         "y_valid": y_sorted.iloc[split_idx:],
         "ids_valid": ids_sorted.iloc[split_idx:],
     }
+    if embed_sorted is not None and not embed_sorted.empty:
+        splits["E_train"] = embed_sorted.iloc[:split_idx]
+        splits["E_valid"] = embed_sorted.iloc[split_idx:]
+    else:
+        splits["E_train"] = None
+        splits["E_valid"] = None
+    return splits
 
 
 def build_catboost_classifier(
@@ -218,18 +233,6 @@ def tune_threshold(
     }
 
 
-def select_dense_feature_columns(df: pd.DataFrame) -> List[str]:
-    """Return columns safe for dense models (numeric only)."""
-    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    if not numeric_cols:
-        raise ValueError("No numeric feature columns available for dense models.")
-    return numeric_cols
-
-
-def dense_matrix(df: pd.DataFrame, columns: List[str]) -> np.ndarray:
-    return df[columns].astype(np.float32).values
-
-
 def summarize_model_metrics(
     y_true: pd.Series,
     probs: np.ndarray,
@@ -324,6 +327,41 @@ def run_optuna_search(
     return study.best_params
 
 
+def train_embedding_mlp(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_valid: pd.DataFrame,
+) -> Tuple[Pipeline, np.ndarray]:
+    if X_train is None or X_valid is None:
+        raise ValueError("Embedding feature splits are required for MLP training.")
+    if X_train.empty or X_valid.empty:
+        raise ValueError("Embedding feature splits must be non-empty.")
+    pipeline = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            (
+                "mlp",
+                MLPClassifier(
+                    hidden_layer_sizes=(128, 64),
+                    activation="relu",
+                    alpha=1e-4,
+                    batch_size=256,
+                    learning_rate_init=1e-3,
+                    max_iter=50,
+                    early_stopping=True,
+                    n_iter_no_change=5,
+                    validation_fraction=0.1,
+                    random_state=42,
+                    verbose=False,
+                ),
+            ),
+        ]
+    )
+    pipeline.fit(X_train.values, y_train)
+    valid_probs = pipeline.predict_proba(X_valid.values)[:, 1]
+    return pipeline, valid_probs
+
+
 def main() -> None:
     args = parse_args()
     args.reports_dir.mkdir(parents=True, exist_ok=True)
@@ -348,8 +386,6 @@ def main() -> None:
         for col in ["type", "domain", "by"]
         if col in splits["X_train"].columns
     ]
-    dense_feature_cols = select_dense_feature_columns(splits["X_train"])
-
     optuna_params: Dict[str, float | int] = {}
     if args.optuna_trials > 0:
         print(
@@ -382,11 +418,35 @@ def main() -> None:
     cat_valid_probs = cat_model.predict_proba(splits["X_valid"])[:, 1]
 
 
+    embedding_train = splits.get("E_train")
+    embedding_valid = splits.get("E_valid")
+    mlp_model = None
+    mlp_valid_probs = None
+    if (
+        isinstance(embedding_train, pd.DataFrame)
+        and isinstance(embedding_valid, pd.DataFrame)
+    ):
+        if embedding_train.empty or embedding_valid.empty:
+            print("Skipping embedding MLP training because embedding features are empty.")
+        else:
+            print("Training embedding MLP on title embeddings...")
+            mlp_model, mlp_valid_probs = train_embedding_mlp(
+                embedding_train,
+                splits["y_train"],
+                embedding_valid,
+            )
+            mlp_path = args.reports_dir / "mlp_title_embeddings.joblib"
+            dump(mlp_model, mlp_path)
+            print(f"Saved embedding MLP model to {mlp_path}")
+
     metrics = {}
     y_valid = splits["y_valid"]
-    for name, probs in [
-        ("catboost", cat_valid_probs),
-    ]:
+    prob_sources = {"catboost": cat_valid_probs}
+    if mlp_valid_probs is not None:
+        prob_sources["embedding_mlp"] = mlp_valid_probs
+        prob_sources["ensemble_mean"] = (cat_valid_probs + mlp_valid_probs) / 2.0
+
+    for name, probs in prob_sources.items():
         _, model_metrics = summarize_model_metrics(
             y_valid,
             probs,
@@ -414,12 +474,11 @@ def main() -> None:
     cat_imp_path = args.reports_dir / "catboost_feature_importance.csv"
 
     save_metrics(metrics_path, metrics)
+    prob_columns = {f"{name}_prob": probs for name, probs in prob_sources.items()}
     save_predictions(
         preds_path,
         splits["ids_valid"],
-        {
-            "catboost_prob": cat_valid_probs
-        },
+        prob_columns,
     )
     save_feature_importance(cat_model, cat_imp_path, cat_features=list(splits["X_train"].columns))
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 from urllib.parse import urlparse
 
 import numpy as np
@@ -20,6 +20,7 @@ class DatasetBundle:
     target: pd.Series
     ids: pd.Series
     timestamps: pd.Series
+    embedding_features: pd.DataFrame | None = None
 
 
 def load_raw_posts(csv_path: Path, n_rows: int | None = None) -> pd.DataFrame:
@@ -82,7 +83,24 @@ class FeatureEngineer:
             top_flag_col="is_top_1pct",
             top_flag_output="user_prior_top1pct_count",
         )
+        work = self._add_historical_features(
+            work,
+            group_col=["by", "domain"],
+            prefix="user_domain",
+        )
 
+        work["user_vs_domain_viral_rate_gap"] = (
+            work["user_prior_viral_rate"] - work["domain_prior_viral_rate"]
+        ).astype(np.float32)
+        work["user_vs_domain_mean_score_gap"] = (
+            work["user_prior_mean_score"] - work["domain_prior_mean_score"]
+        ).astype(np.float32)
+
+        embedding_features = (
+            work[self._title_embedding_cols].copy()
+            if self._title_embedding_cols
+            else pd.DataFrame(index=work.index)
+        )
         feature_cols = self._select_feature_columns(work)
         features = work[feature_cols].copy()
         self._finalize_feature_dtypes(features)
@@ -95,6 +113,7 @@ class FeatureEngineer:
             target=target,
             ids=ids,
             timestamps=timestamps,
+            embedding_features=embedding_features,
         )
 
     def _add_temporal_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -119,29 +138,40 @@ class FeatureEngineer:
     def _add_historical_features(
         self,
         df: pd.DataFrame,
-        group_col: str,
+        group_col: str | Sequence[str],
         prefix: str,
         top_flag_col: str | None = None,
         top_flag_output: str | None = None,
     ) -> pd.DataFrame:
-        cols = [group_col, "time", "is_viral", "score"]
+        group_cols = [group_col] if isinstance(group_col, str) else list(group_col)
+        cols = [*group_cols, "time", "is_viral", "score"]
         if top_flag_col and top_flag_col not in cols:
             cols.append(top_flag_col)
         working = df[cols].copy()
         working = working.sort_values("time")
-        grouped = working.groupby(group_col, sort=False, dropna=False)
+        grouped = working.groupby(group_cols, sort=False, dropna=False)
+        if len(group_cols) == 1:
+            groupby_keys = working[group_cols[0]]
+        else:
+            groupby_keys = [working[col] for col in group_cols]
 
         prior_posts = grouped.cumcount()
         prior_viral = grouped["is_viral"].cumsum() - working["is_viral"]
         prior_scores = grouped["score"].cumsum() - working["score"]
         prior_hours = grouped["time"].diff() / 3600.0
+        prior_mean_score = prior_scores / prior_posts.replace(0, np.nan)
+        shifted_scores = grouped["score"].shift(1)
+        prior_max_score = shifted_scores.groupby(
+            groupby_keys, sort=False, dropna=False
+        ).cummax()
 
         data = {
             f"{prefix}_prior_posts": prior_posts,
             f"{prefix}_prior_viral_count": prior_viral,
-            f"{prefix}_prior_mean_score": prior_scores / prior_posts.replace(0, np.nan),
+            f"{prefix}_prior_mean_score": prior_mean_score,
             f"{prefix}_prior_viral_rate": prior_viral / prior_posts.replace(0, np.nan),
             f"{prefix}_hours_since_last": prior_hours,
+            f"{prefix}_prior_max_score": prior_max_score,
         }
         top_flag_feature = top_flag_output or (
             f"{prefix}_prior_top_flag_count" if top_flag_col else None
@@ -170,6 +200,9 @@ class FeatureEngineer:
         stats[f"{prefix}_hours_since_last"] = stats[
             f"{prefix}_hours_since_last"
         ].astype(np.float32)
+        stats[f"{prefix}_prior_max_score"] = stats[
+            f"{prefix}_prior_max_score"
+        ].astype(np.float32)
         if top_flag_feature:
             stats[top_flag_feature] = stats[top_flag_feature].astype(np.float32)
 
@@ -188,8 +221,22 @@ class FeatureEngineer:
         stats[f"{prefix}_hours_since_last"] = stats[f"{prefix}_hours_since_last"].fillna(
             median_hours
         )
+        stats[f"{prefix}_prior_max_score"] = stats[f"{prefix}_prior_max_score"].fillna(
+            overall_score
+        )
         if top_flag_feature:
             stats[top_flag_feature] = stats[top_flag_feature].fillna(0.0)
+
+        if prefix in {"user", "user_domain"}:
+            stats[f"{prefix}_avg_score"] = stats[f"{prefix}_prior_mean_score"].astype(
+                np.float32
+            )
+            stats[f"{prefix}_mean_score"] = stats[f"{prefix}_prior_mean_score"].astype(
+                np.float32
+            )
+            stats[f"{prefix}_max_score"] = stats[f"{prefix}_prior_max_score"].astype(
+                np.float32
+            )
 
         return df.join(stats, how="left")
         
@@ -243,28 +290,15 @@ class FeatureEngineer:
         base_cols = [
             "posted_hour",
             "posted_dayofweek",
-            "url_length",
-            "has_query",
-            "path_depth",
-            "is_root_domain",
-            "is_self_post",
-            "domain_token_len",
-            "domain_prior_posts",
-            "domain_prior_posts_log1p",
-            "domain_prior_viral_count",
-            "domain_prior_mean_score",
-            "domain_prior_viral_rate",
-            "domain_hours_since_last",
-            "user_prior_posts",
-            "user_prior_posts_log1p",
-            "user_prior_viral_count",
-            "user_prior_mean_score",
-            "user_prior_viral_rate",
-            "user_hours_since_last",
-            "user_prior_top1pct_count",
+            "user_avg_score",
+            "user_mean_score",
+            "user_max_score",
+            "user_domain_avg_score",
+            "user_domain_mean_score",
+            "user_domain_max_score",
         ]
         categorical = ["domain", "by"]
-        return base_cols + self._title_embedding_cols + categorical
+        return base_cols + categorical
 
     def _finalize_feature_dtypes(self, features: pd.DataFrame) -> None:
         for col in features.select_dtypes(include=["float64"]).columns:
@@ -288,3 +322,6 @@ class FeatureEngineer:
         path = urlparse(url).path
         parts = [segment for segment in path.split("/") if segment]
         return len(parts)
+
+    def get_title_embedding_columns(self) -> List[str]:
+        return list(self._title_embedding_cols)
