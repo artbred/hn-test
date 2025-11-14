@@ -56,7 +56,7 @@ def chronological_split(
     if not 0 < train_fraction < 1:
         raise ValueError("train_fraction must be between 0 and 1.")
 
-    order = np.argsort(bundle.features["post_timestamp_days"].values)
+    order = np.argsort(bundle.timestamps.values)
     X_sorted = bundle.features.iloc[order].reset_index(drop=True)
     y_sorted = bundle.target.iloc[order].reset_index(drop=True)
     ids_sorted = bundle.ids.iloc[order].reset_index(drop=True)
