@@ -134,6 +134,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Whether to enable trust_remote_code when loading the embedding model.",
     )
+    parser.add_argument(
+        "--n-rows",
+        type=int,
+        default=None,
+        help="If provided, limit the loaded dataset to the first n rows.",
+    )
     return parser.parse_args()
 
 
@@ -402,7 +408,7 @@ def save_predictions(
 def main() -> None:
     args = parse_args()
     args.reports_dir.mkdir(parents=True, exist_ok=True)
-    raw = load_raw_posts(args.data_path)
+    raw = load_raw_posts(args.data_path, n_rows=args.n_rows)
     raw["title"] = raw["title"].fillna("")
     raw["by"] = raw["by"].fillna("unknown")
     raw["url"] = raw["url"].fillna("")
