@@ -47,6 +47,12 @@ def parse_args() -> argparse.Namespace:
         default=0.8,
         help="Fraction of earliest posts to use for training (chronological split).",
     )
+    parser.add_argument(
+        "--title-embedding-cache",
+        type=Path,
+        default=repo_root / "data" / "embeddings" / "title_minilm.npy",
+        help="Path to cache sentence-transformer embeddings (.npy).",
+    )
     return parser.parse_args()
 
 
@@ -166,7 +172,10 @@ def main() -> None:
     viral_rate = (raw["score"] > 500).mean()
     print(f"Baseline viral rate (>500 score): {viral_rate:.2%}")
 
-    engineer = FeatureEngineer(viral_threshold=500)
+    engineer = FeatureEngineer(
+        viral_threshold=500,
+        title_embedding_cache_path=args.title_embedding_cache,
+    )
     bundle = engineer.transform(raw)
 
     splits = chronological_split(bundle, args.train_fraction)

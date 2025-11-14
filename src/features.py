@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -9,7 +8,8 @@ from urllib.parse import urlparse
 import numpy as np
 import pandas as pd
 import tldextract
-import re
+
+from embeddings import compute_sentence_embeddings
 
 
 @dataclass
@@ -33,19 +33,25 @@ def load_raw_posts(csv_path: Path, n_rows: int | None = None) -> pd.DataFrame:
 class FeatureEngineer:
     """Build leakage-safe features for HN virality modeling."""
 
-    _token_pattern = re.compile(r"[a-z0-9]+")
-
     def __init__(
         self,
         viral_threshold: int = 500,
-        title_vocab_size: int = 100,
-        title_min_freq: int = 500,
+        title_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        title_embedding_cache_path: str | Path | None = None,
+        title_embedding_batch_size: int = 256,
+        title_embedding_normalize: bool = False,
     ) -> None:
         self.viral_threshold = viral_threshold
         self._extractor = tldextract.TLDExtract(include_psl_private_domains=True)
-        self.title_vocab_size = title_vocab_size
-        self.title_min_freq = title_min_freq
-        self._title_token_cols: List[str] = []
+        self.title_embedding_model = title_embedding_model
+        self.title_embedding_cache_path = (
+            Path(title_embedding_cache_path)
+            if title_embedding_cache_path is not None
+            else None
+        )
+        self.title_embedding_batch_size = title_embedding_batch_size
+        self.title_embedding_normalize = title_embedding_normalize
+        self._title_embedding_cols: List[str] = []
 
     def transform(self, df: pd.DataFrame) -> DatasetBundle:
         work = df.copy()
@@ -56,7 +62,7 @@ class FeatureEngineer:
 
         work = self._add_temporal_features(work)
         work = self._add_url_features(work)
-        self._title_token_cols = self._add_title_token_features(work)
+        self._title_embedding_cols = self._add_title_embeddings(work)
 
         work = self._add_historical_features(work, group_col="domain", prefix="domain")
         work = self._add_historical_features(work, group_col="by", prefix="user")
@@ -158,47 +164,26 @@ class FeatureEngineer:
             df[col] = stats[col]
         return df
 
-    def _add_title_token_features(self, df: pd.DataFrame) -> List[str]:
-        if self.title_vocab_size <= 0:
-            return []
-        vocab = self._build_title_vocab(df["title"])
-        if not vocab:
+    def _add_title_embeddings(self, df: pd.DataFrame) -> List[str]:
+        if not self.title_embedding_model:
             return []
 
-        token_to_idx = {token: idx for idx, token in enumerate(vocab)}
-        matrix = np.zeros((len(df), len(vocab)), dtype=np.int16)
+        embeddings = compute_sentence_embeddings(
+            texts=df["title"].tolist(),
+            model_name=self.title_embedding_model,
+            batch_size=self.title_embedding_batch_size,
+            cache_path=self.title_embedding_cache_path,
+            normalize=self.title_embedding_normalize,
+        )
+        if embeddings.shape[0] != len(df):
+            raise ValueError(
+                "Embedding row count does not match dataframe length: "
+                f"{embeddings.shape[0]} vs {len(df)}"
+            )
 
-        for row_idx, title in enumerate(df["title"].tolist()):
-            tokens = self._tokenize_title(title)
-            if not tokens:
-                continue
-            counts = Counter(tokens)
-            for token, count in counts.items():
-                idx = token_to_idx.get(token)
-                if idx is not None:
-                    matrix[row_idx, idx] = count
-
-        new_cols = [f"title_tok_{token}" for token in vocab]
-        df[new_cols] = matrix
-        return new_cols
-
-    def _build_title_vocab(self, titles: pd.Series) -> List[str]:
-        counter: Counter[str] = Counter()
-        for title in titles.tolist():
-            counter.update(self._tokenize_title(title))
-        filtered = [
-            (token, freq)
-            for token, freq in counter.items()
-            if freq >= self.title_min_freq
-        ]
-        filtered.sort(key=lambda item: item[1], reverse=True)
-        vocab = [token for token, _ in filtered[: self.title_vocab_size]]
-        return vocab
-
-    def _tokenize_title(self, title: str) -> List[str]:
-        if not isinstance(title, str):
-            return []
-        return self._token_pattern.findall(title.lower())
+        col_names = [f"title_emb_{i:03d}" for i in range(embeddings.shape[1])]
+        df[col_names] = embeddings.astype(np.float32)
+        return col_names
 
     def _select_feature_columns(self, df: pd.DataFrame) -> List[str]:
         base_cols = [
@@ -224,7 +209,7 @@ class FeatureEngineer:
             "user_hours_since_last",
         ]
         categorical = ["domain", "by"]
-        return base_cols + self._title_token_cols + categorical
+        return base_cols + self._title_embedding_cols + categorical
 
     def _finalize_feature_dtypes(self, features: pd.DataFrame) -> None:
         for col in features.select_dtypes(include=["float64"]).columns:
@@ -248,5 +233,3 @@ class FeatureEngineer:
         path = urlparse(url).path
         parts = [segment for segment in path.split("/") if segment]
         return len(parts)
-
-
