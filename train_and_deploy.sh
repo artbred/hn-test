@@ -200,11 +200,19 @@ train_model() {
     
     # Setup Python environment
     log_info "Setting up Python environment with UV..."
+    
+    # Remove existing venv if it exists to avoid prompts
+    if [ -d ".venv" ]; then
+        log_warn "Removing existing virtual environment..."
+        rm -rf .venv
+    fi
+    
     uv venv
     source .venv/bin/activate
     
     log_info "Installing dependencies..."
     uv pip install -e .
+
     
     # Create reports directory
     mkdir -p reports
