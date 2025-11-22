@@ -34,10 +34,22 @@ class Predictor(BasePredictor):
         cache_path_value = os.environ.get("TITLE_EMBEDDING_CACHE")
         cache_path = Path(cache_path_value) if cache_path_value else None
 
+        stats_path = Path(os.environ.get("FEATURE_STATS_PATH", "reports/feature_stats.json"))
+        if stats_path.exists():
+            with open(stats_path) as f:
+                stats_store = json.load(f)
+        else:
+            raise FileNotFoundError(
+                f"Feature stats not found at {stats_path}. "
+                "Inference cannot proceed without historical features. "
+                "Run `src/feature_stats.py` to generate them."
+            )
+
         self.feature_engineer = FeatureEngineer(
             viral_threshold=viral_threshold,
             title_embedding_model=title_embedding_model,
             title_embedding_cache_path=cache_path,
+            stats_store=stats_store,
         )
         self.categorical_features = ("by", "domain")
 

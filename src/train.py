@@ -4,7 +4,13 @@ import argparse
 import importlib
 import json
 from pathlib import Path
+import sys
 from typing import Dict, List, Tuple
+
+# Ensure project root is in sys.path so we can import from src
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.append(str(repo_root))
 
 import numpy as np
 import pandas as pd
@@ -17,7 +23,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from features import DatasetBundle, FeatureEngineer, load_raw_posts
+from src.features import DatasetBundle, FeatureEngineer, load_raw_posts
 
 
 def parse_args() -> argparse.Namespace:
@@ -422,6 +428,10 @@ def main() -> None:
     cat_model.save_model(args.reports_dir / "catboost_model.cbm")
 
     print(f"Artifacts saved under {args.reports_dir}")
+    
+    print("Exporting feature stats for inference...")
+    from src.feature_stats import export_stats
+    export_stats(args.data_path, args.reports_dir / "feature_stats.json")
 
 
 if __name__ == "__main__":

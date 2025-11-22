@@ -12,6 +12,7 @@ import tldextract
 # from sklearn.preprocessing import StandardScaler
 
 # from embeddings import compute_sentence_embeddings
+from src.feature_stats import add_historical_features_from_store
 
 
 @dataclass
@@ -45,6 +46,7 @@ class FeatureEngineer:
         title_embedding_normalize: bool = True,
         title_embedding_dim: int | None = 32,
         title_embedding_scale: bool = True,
+        stats_store: Dict[str, Any] | None = None,
     ) -> None:
         self.viral_threshold = viral_threshold
         self._extractor = tldextract.TLDExtract(include_psl_private_domains=True)
@@ -58,6 +60,7 @@ class FeatureEngineer:
         self.title_embedding_normalize = title_embedding_normalize
         self.title_embedding_dim = title_embedding_dim
         self.title_embedding_scale = title_embedding_scale
+        self.stats_store = stats_store
         self._title_embedding_cols: List[str] = []
 
     def transform(self, df: pd.DataFrame) -> DatasetBundle:
@@ -143,6 +146,11 @@ class FeatureEngineer:
         top_flag_col: str | None = None,
         top_flag_output: str | None = None,
     ) -> pd.DataFrame:
+        if self.stats_store:
+             return add_historical_features_from_store(
+                 df, self.stats_store, group_col, prefix, top_flag_col, top_flag_output
+             )
+
         group_cols = [group_col] if isinstance(group_col, str) else list(group_col)
         cols = [*group_cols, "time", "is_viral", "score"]
         if top_flag_col and top_flag_col not in cols:
