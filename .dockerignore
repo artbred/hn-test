@@ -4,13 +4,17 @@
 .gitattributes
 results
 
-# Python
+# Python virtual environments and caches
 __pycache__/
 *.py[cod]
 *.pyc
 *$py.class
 *.so
 .Python
+.venv/
+.venv
+venv/
+env/
 build/
 develop-eggs/
 dist/
@@ -26,6 +30,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+uv.lock
 
 # Testing
 .pytest_cache/
@@ -42,12 +47,16 @@ htmlcov/
 *.swo
 .DS_Store
 
-# Data (exclude raw data, keep models)
+# Data files (exclude raw data, training artifacts)
 data/
 logs/
 *.log
 training_log.txt
 catboost_info/
+*.jsonl
+*.csv
+*.parquet
+test_data/
 
 # Documentation
 docs/
@@ -58,9 +67,15 @@ docs/
 .github/
 .gitlab-ci.yml
 
-# Other
+# Training scripts and notebooks
+scripts/
+evaluate_inference.py
+
+# Build artifacts
+.cog
 .env
 .env.*
-*.csv
-*.parquet
-test_data/
+
+# Training/development only files
+train_and_deploy.sh
+pyproject.toml

@@ -276,6 +276,28 @@ build_docker_image() {
     COG_VERSION=$(cog --version 2>&1)
     log_info "Cog version: $COG_VERSION"
     
+    # Clean up any running containers with this name
+    log_info "Cleaning up old containers and images..."
+    if docker ps -a --format '{{.Names}}' | grep -q "^${DOCKER_IMAGE_NAME}$"; then
+        log_warn "Stopping and removing existing container: $DOCKER_IMAGE_NAME"
+        docker stop "$DOCKER_IMAGE_NAME" 2>/dev/null || true
+        docker rm "$DOCKER_IMAGE_NAME" 2>/dev/null || true
+    fi
+    
+    # Remove old images to save space
+    OLD_IMAGES=$(docker images "${DOCKER_IMAGE_NAME}" -q)
+    if [ -n "$OLD_IMAGES" ]; then
+        log_warn "Removing old images to save space..."
+        docker rmi $OLD_IMAGES 2>/dev/null || true
+    fi
+    
+    # Clean up dangling images
+    DANGLING=$(docker images -f "dangling=true" -q)
+    if [ -n "$DANGLING" ]; then
+        log_info "Removing dangling images..."
+        docker rmi $DANGLING 2>/dev/null || true
+    fi
+    
     # Verify model exists
     if [ ! -f "reports/catboost_model.cbm" ]; then
         log_error "Model file not found. Please train the model first."
@@ -289,6 +311,7 @@ build_docker_image() {
     fi
     
     log_info "Building Docker image with Cog: $DOCKER_IMAGE_NAME"
+    echo "This may take a few minutes..."
     
     # Build the Docker image using Cog
     cog build -t "$DOCKER_IMAGE_NAME:latest"
@@ -300,6 +323,10 @@ build_docker_image() {
         IMAGE_SIZE=$(docker images "$DOCKER_IMAGE_NAME:latest" --format "{{.Size}}")
         echo "  - Image: $DOCKER_IMAGE_NAME:latest"
         echo "  - Size: $IMAGE_SIZE"
+        
+        # Show what's consuming space
+        log_info "Image layers breakdown:"
+        docker history "$DOCKER_IMAGE_NAME:latest" --human --format "table {{.Size}}\t{{.CreatedBy}}" | head -10
     else
         log_error "Cog build failed"
         exit 1
