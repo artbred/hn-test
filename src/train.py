@@ -419,6 +419,7 @@ def main() -> None:
         prob_columns,
     )
     save_feature_importance(cat_model, cat_imp_path, cat_features=list(splits["X_train"].columns))
+    cat_model.save_model(args.reports_dir / "catboost_model.cbm")
 
     print(f"Artifacts saved under {args.reports_dir}")
 

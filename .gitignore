@@ -15,6 +15,7 @@ reports/*
 .cog
 eggs/
 *.joblib
+reports
 .venv
 .eggs/
 lib/

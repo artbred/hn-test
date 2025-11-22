@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 import os
 from pathlib import Path
@@ -8,16 +6,7 @@ from typing import Any, Dict
 import pandas as pd
 from catboost import CatBoostClassifier
 
-try:  # pragma: no cover - allows local dev without Cog installed
-    from cog import BasePredictor, Input  # type: ignore[import-not-found]
-except ImportError:  # pragma: no cover
-    class BasePredictor:  # type: ignore[misc]
-        pass
-
-    class Input:  # type: ignore[misc]
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass
-
+from cog import BasePredictor, Input 
 from src.features import FeatureEngineer
 
 
@@ -38,22 +27,6 @@ class Predictor(BasePredictor):
         self.model = CatBoostClassifier()
         self.model.load_model(str(model_path))
 
-        metrics_path = Path(
-            os.environ.get("CATBOOST_METRICS_PATH", "reports/metrics.json")
-        )
-        self.default_threshold = 0.5
-        if metrics_path.exists():
-            try:
-                metrics = json.loads(metrics_path.read_text())
-                self.default_threshold = float(
-                    metrics.get("catboost", {}).get(
-                        "decision_threshold", self.default_threshold
-                    )
-                )
-            except (json.JSONDecodeError, ValueError):
-                # Fallback to the default threshold when the metrics file is corrupt.
-                pass
-
         viral_threshold = int(os.environ.get("VIRAL_SCORE_THRESHOLD", "250"))
         title_embedding_model = os.environ.get(
             "TITLE_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
@@ -70,16 +43,17 @@ class Predictor(BasePredictor):
 
     def predict(
         self,
-        title: str = Input(description="Post title text."),
+        title: str = Input(description="Post title text.", default="AI is going to take over the world"),
         url: str = Input(
-            default="",
+            default="https://openai.com",
             description="Post URL (empty string for self posts).",
         ),
         by: str = Input(
-            default="unknown",
+            default="zama",
             description="Author username.",
         ),
         time: int = Input(
+            default=1763807356,
             ge=0,
             description="Unix timestamp (seconds) when the post was created.",
         ),
@@ -89,26 +63,15 @@ class Predictor(BasePredictor):
         bundle = self.feature_engineer.transform(raw)
         features = bundle.features
         if features.empty:
-            return {"threshold": self.default_threshold, "prediction": None}
+            return {"probability": None}
 
-        cat_feature_idx = [
-            features.columns.get_loc(col)
-            for col in self.categorical_features
-            if col in features.columns
-        ]
         probabilities = self.model.predict_proba(
             features,
-            cat_features=cat_feature_idx if cat_feature_idx else None,
         )[:, 1]
 
         probability = float(probabilities[0])
-        is_viral = bool(probability >= self.default_threshold)
         return {
-            "threshold": self.default_threshold,
-            "prediction": {
-                "probability": probability,
-                "is_viral": is_viral,
-            },
+            "probability": probability,
         }
 
     def _build_single_row(self, title: str, url: str, by: str, time: int) -> pd.DataFrame:

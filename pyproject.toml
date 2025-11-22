@@ -16,4 +16,5 @@ dependencies = [
     "transformers[torch]>=4.57.1",
     "optuna>=4.6.0",
     "imbalanced-learn>=0.12.3",
+    "cog>=0.16.8",
 ]
