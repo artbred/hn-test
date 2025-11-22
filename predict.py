@@ -53,7 +53,7 @@ class Predictor(BasePredictor):
         )
         self.categorical_features = ("by", "domain")
 
-    def predict(
+    async def predict(
         self,
         title: str = Input(description="Post title text.", default="AI is going to take over the world"),
         url: str = Input(

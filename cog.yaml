@@ -2,5 +2,11 @@ build:
   gpu: false
   python_version: "3.11"
   python_requirements: requirements.txt
+  
 predict: "predict.py:Predictor"
+
+concurrency:
+  max: 10
+
+image: "docker.io/artbred/hn_virality"
 
