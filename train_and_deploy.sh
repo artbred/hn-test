@@ -347,7 +347,7 @@ start_docker_container() {
         docker rm "$DOCKER_IMAGE_NAME" 2>/dev/null || true
     fi
     
-    log_info "Starting new container with Cog..."
+    log_info "Starting new container..."
     # Run the Cog-built container
     # Cog containers expose port 5000 by default for predictions
     docker run -d \

@@ -72,7 +72,6 @@ scripts/
 evaluate_inference.py
 
 # Build artifacts
-.cog
 .env
 .env.*
 
